@@ -28,10 +28,26 @@ use crate::{interrupt, peripherals};
 // available after reserving CC1 for regular time keeping. For example, TIM2 has four CC registers:
 // CC1, CC2, CC3, and CC4, so it can provide ALARM_COUNT = 3.
 
-#[cfg(not(any(time_driver_tim12, time_driver_tim15, time_driver_tim21, time_driver_tim22)))]
+// Additional note, for the stm32wb55, TIM16/TIM17 have two CC registers
+
+#[cfg(not(any(
+    time_driver_tim12,
+    time_driver_tim15,
+    time_driver_tim16,
+    time_driver_tim17,
+    time_driver_tim21,
+    time_driver_tim22
+)))]
 const ALARM_COUNT: usize = 3;
 
-#[cfg(any(time_driver_tim12, time_driver_tim15, time_driver_tim21, time_driver_tim22))]
+#[cfg(any(
+    time_driver_tim12,
+    time_driver_tim15,
+    time_driver_tim16,
+    time_driver_tim17,
+    time_driver_tim21,
+    time_driver_tim22
+))]
 const ALARM_COUNT: usize = 1;
 
 #[cfg(time_driver_tim2)]
@@ -50,6 +66,10 @@ type T = peripherals::TIM11;
 type T = peripherals::TIM12;
 #[cfg(time_driver_tim15)]
 type T = peripherals::TIM15;
+#[cfg(time_driver_tim16)]
+type T = peripherals::TIM16;
+#[cfg(time_driver_tim17)]
+type T = peripherals::TIM17;
 #[cfg(time_driver_tim21)]
 type T = peripherals::TIM21;
 #[cfg(time_driver_tim22)]
@@ -114,6 +134,22 @@ foreach_interrupt! {
     };
     (TIM15, timer, $block:ident, UP, $irq:ident) => {
         #[cfg(time_driver_tim15)]
+        #[cfg(feature = "rt")]
+        #[interrupt]
+        fn $irq() {
+            DRIVER.on_interrupt()
+        }
+    };
+    (TIM16, timer, $block:ident, UP, $irq:ident) => {
+        #[cfg(time_driver_tim16)]
+        #[cfg(feature = "rt")]
+        #[interrupt]
+        fn $irq() {
+            DRIVER.on_interrupt()
+        }
+    };
+    (TIM17, timer, $block:ident, UP, $irq:ident) => {
+        #[cfg(time_driver_tim17)]
         #[cfg(feature = "rt")]
         #[interrupt]
         fn $irq() {

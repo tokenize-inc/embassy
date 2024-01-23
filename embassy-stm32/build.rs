@@ -191,6 +191,8 @@ fn main() {
         Some("tim11") => "TIM11",
         Some("tim12") => "TIM12",
         Some("tim15") => "TIM15",
+        Some("tim16") => "TIM16",
+        Some("tim17") => "TIM17",
         Some("tim21") => "TIM21",
         Some("tim22") => "TIM22",
         Some("any") => {
@@ -210,6 +212,10 @@ fn main() {
                 "TIM12"
             } else if singletons.contains(&"TIM15".to_string()) {
                 "TIM15"
+            } else if singletons.contains(&"TIM16".to_string()) {
+                "TIM16"
+            } else if singletons.contains(&"TIM17".to_string()) {
+                "TIM17"
             } else if singletons.contains(&"TIM21".to_string()) {
                 "TIM21"
             } else if singletons.contains(&"TIM22".to_string()) {
