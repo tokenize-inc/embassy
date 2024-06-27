@@ -56,6 +56,9 @@ pub mod timer;
 
 #[cfg(aes)]
 pub mod aes;
+#[cfg(pka)]
+pub mod pka;
+
 
 #[cfg(adc)]
 pub mod adc;
