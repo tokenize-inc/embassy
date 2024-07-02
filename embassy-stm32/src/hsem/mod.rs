@@ -17,6 +17,7 @@ const PART_ID_CORTEXM7: u32 = 0x70;
 
 /// HSEM error.
 #[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum HsemError {
     /// Locking the semaphore failed.
     LockFailed,
