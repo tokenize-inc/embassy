@@ -51,6 +51,7 @@ mod thread {
     use core::arch::asm;
     use core::marker::PhantomData;
 
+    use cortex_m::interrupt;
     pub use embassy_executor_macros::main_cortex_m as main;
 
     use crate::{raw, Spawner};
@@ -100,10 +101,83 @@ mod thread {
         pub fn run(&'static mut self, init: impl FnOnce(Spawner)) -> ! {
             init(self.inner.spawner());
 
+            //- - - - -
+            const DWT_CTRL: *mut u32 = 0xE000_1000usize as _;
+            const DWT_CYCCNT: *mut u32 = 0xE000_1004usize as _;
+            const DWT_SLEEPCNT: *mut u32 = 0xE000_1010usize as _;
+
+            const CORE_DEBUG: *mut u32 = 0xE000_EDF0usize as _;
+            const CORE_DEBUG_DEMCR: *mut u32 = 0xE000_EDFCusize as _;
+
+            unsafe {
+                // Enable the debug exception and monitor controls regisrers.
+                const CORE_DEBUG_DEMCR_TRCENA: usize = 24;
+
+                let mut core_debug_demcr = core::ptr::read_volatile(CORE_DEBUG_DEMCR);
+                //                core_debug_demcr |= !(1 << CORE_DEBUG_DEMCR_TRCENA);
+                core_debug_demcr |= 0x0100_0000;
+                core::ptr::write_volatile(CORE_DEBUG_DEMCR, core_debug_demcr);
+
+                // Enable the debug registers
+                const LAR: *mut u32 = 0xE000_1FB0usize as _;
+                let lar = 0xC5AC_CE55;
+                core::ptr::write_volatile(LAR, lar);
+
+                // Enable the cycle and sleep counters
+                const DWT_CYCCNT_EN: usize = 1;
+                const DWT_SLEEPCNT_EN: usize = 19;
+
+                // Clear out the cycle count
+                let dwt_cyccnt = 0;
+                core::ptr::write_volatile(DWT_CYCCNT, dwt_cyccnt);
+
+                // Clear out the sleep count
+                let dwt_sleepcnt = 0;
+                core::ptr::write_volatile(DWT_SLEEPCNT, dwt_sleepcnt);
+
+                let mut dwt_ctrl = core::ptr::read_volatile(DWT_CTRL);
+                dwt_ctrl |= !(1 << DWT_CYCCNT_EN); // Enable the cycle counter
+                dwt_ctrl |= !(1 << DWT_SLEEPCNT_EN); // Enable the sleep counter
+                core::ptr::write_volatile(DWT_CTRL, dwt_ctrl);
+            }
+
+            let mut _t: u32;
+            let mut _l: u32 = 0;
+            let mut _working_time: u32 = 0;
+            let mut _sleeping_time: u32 = 0;
+            let mut _iterations: u64 = 0;
+            let mut _load: f32 = 0.0;
+            let mut ticker = 0;
+
             loop {
                 unsafe {
+                    ticker += 1;
                     self.inner.poll();
+
+                    //cortex_m::interrupt::disable();
+
+                    // Enable the debug registers
+                    const LAR: *mut u32 = 0xE000_1FB0usize as _;
+                    let lar = 0xC5AC_CE55;
+                    core::ptr::write_volatile(LAR, lar);
+
+                    _working_time += core::ptr::read_volatile(DWT_CYCCNT) - _l;
+                    _t = core::ptr::read_volatile(DWT_CYCCNT);
+
+                    asm!("sev");
                     asm!("wfe");
+                    asm!("wfe");
+
+                    _sleeping_time += core::ptr::read_volatile(DWT_CYCCNT) - _t;
+                    _l = core::ptr::read_volatile(DWT_CYCCNT);
+
+                    //cortex_m::interrupt::enable();
+
+                    if ticker >= 1000 {
+                        _load = (_working_time as f32 / _sleeping_time as f32) as f32;
+                        defmt::debug!("W: {} S: {} L: {}%", _working_time, _sleeping_time, _load);
+                        ticker = 0;
+                    }
                 };
             }
         }
