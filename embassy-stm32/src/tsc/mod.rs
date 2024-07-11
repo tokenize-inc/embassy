@@ -4,6 +4,10 @@
 //! # Example (stm32)
 //! ``` rust, ignore
 //!
+//! bind_interrupts!(struct Irqs {
+//! TSC => tsc::InterruptHandler<TSC>;
+//! });
+//!
 //! let mut device_config = embassy_stm32::Config::default();
 //! {
 //!     device_config.rcc.mux = ClockSrc::MSI(Msirange::RANGE_4MHZ);
@@ -50,13 +54,12 @@
 //!     None,
 //!     Some(g7),
 //!     None,
+//!     Irqs,
 //!     config,
 //! );
 //!
-//! touch_controller.discharge_io(true);
-//! Timer::after_millis(1).await;
 //!
-//! touch_controller.start();
+//! touch_controller.read_group_value(Group::Six).await;
 //!
 //! ```
 
@@ -65,15 +68,19 @@
 /// Enums defined for peripheral parameters
 pub mod enums;
 
+use core::future::poll_fn;
 use core::marker::PhantomData;
+use core::task::Poll;
 
 use embassy_hal_internal::{into_ref, PeripheralRef};
 pub use enums::*;
 
 use crate::gpio::{AFType, AnyPin};
+use crate::interrupt::typelevel::Interrupt;
+use crate::pac::tsc::regs::{Ier, Ioccr, Iogcsr, Iohcr, Ioscr};
 use crate::pac::tsc::Tsc as Regs;
 use crate::rcc::{self, RccPeripheral};
-use crate::{peripherals, Peripheral};
+use crate::{interrupt, peripherals, Peripheral};
 
 #[cfg(tsc_v1)]
 const TSC_NUM_GROUPS: u32 = 6;
@@ -98,19 +105,6 @@ pub enum PinType {
     Sample,
     /// Shield pin connected to capacitive sensing shield
     Shield,
-}
-
-/// Peripheral state
-#[derive(PartialEq, Clone, Copy)]
-pub enum State {
-    /// Peripheral is being setup or reconfigured
-    Reset,
-    /// Ready to start acquisition
-    Ready,
-    /// In process of sensor acquisition
-    Busy,
-    /// Error occured during acquisition
-    Error,
 }
 
 /// Individual group status checked after acquisition reported as complete
@@ -490,8 +484,7 @@ pub struct Tsc<'d, T: Instance> {
     _g7: Option<PinGroup<'d, T, G7>>,
     #[cfg(tsc_v3)]
     _g8: Option<PinGroup<'d, T, G8>>,
-    state: State,
-    config: Config,
+    _config: Config,
 }
 
 impl<'d, T: Instance> Tsc<'d, T> {
@@ -506,6 +499,7 @@ impl<'d, T: Instance> Tsc<'d, T> {
         g6: Option<PinGroup<'d, T, G6>>,
         #[cfg(any(tsc_v2, tsc_v3))] g7: Option<PinGroup<'d, T, G7>>,
         #[cfg(tsc_v3)] g8: Option<PinGroup<'d, T, G8>>,
+        _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         config: Config,
     ) -> Self {
         // Need to check valid pin configuration input
@@ -677,6 +671,13 @@ impl<'d, T: Instance> Tsc<'d, T> {
             w.set_am(config.acquisition_mode);
         });
 
+        // Ensure the rest of the registers are at their reset values
+        T::REGS.ier().write_value(Ier::default());
+        T::REGS.iohcr().write_value(Iohcr::default());
+        T::REGS.ioccr().write_value(Ioccr::default());
+        T::REGS.ioscr().write_value(Ioscr::default());
+        T::REGS.iogcsr().write_value(Iogcsr::default());
+
         // Set IO configuration
         // Disable Schmitt trigger hysteresis on all used TSC IOs
         T::REGS
@@ -694,17 +695,11 @@ impl<'d, T: Instance> Tsc<'d, T> {
             .iogcsr()
             .write(|w| w.0 = Self::extract_groups(config.channel_ios));
 
-        // Disable interrupts
-        T::REGS.ier().modify(|w| {
-            w.set_eoaie(false);
-            w.set_mceie(false);
-        });
-
-        // Clear flags
-        T::REGS.icr().modify(|w| {
-            w.set_eoaic(true);
-            w.set_mceic(true);
-        });
+        T::REGS.ier().modify(|w| w.set_eoaie(true));
+        T::Interrupt::unpend();
+        unsafe {
+            T::Interrupt::enable();
+        }
 
         Self {
             _peri: peri,
@@ -718,128 +713,8 @@ impl<'d, T: Instance> Tsc<'d, T> {
             _g7: g7,
             #[cfg(tsc_v3)]
             _g8: g8,
-            state: State::Ready,
-            config,
+            _config: config,
         }
-    }
-
-    /// Start charge transfer acquisition
-    pub fn start(&mut self) {
-        self.state = State::Busy;
-
-        // Disable interrupts
-        T::REGS.ier().modify(|w| {
-            w.set_eoaie(false);
-            w.set_mceie(false);
-        });
-
-        // Clear flags
-        T::REGS.icr().modify(|w| {
-            w.set_eoaic(true);
-            w.set_mceic(true);
-        });
-
-        // Set the touch sensing IOs not acquired to the default mode
-        T::REGS.cr().modify(|w| {
-            w.set_iodef(self.config.io_default_mode);
-        });
-
-        // Start the acquisition
-        T::REGS.cr().modify(|w| {
-            w.set_start(true);
-        });
-    }
-
-    /// Start charge transfer acquisition with interrupts enabled
-    pub fn start_it(&mut self) {
-        self.state = State::Busy;
-
-        // Enable interrupts
-        T::REGS.ier().modify(|w| {
-            w.set_eoaie(true);
-            w.set_mceie(self.config.max_count_interrupt);
-        });
-
-        // Clear flags
-        T::REGS.icr().modify(|w| {
-            w.set_eoaic(true);
-            w.set_mceic(true);
-        });
-
-        // Set the touch sensing IOs not acquired to the default mode
-        T::REGS.cr().modify(|w| {
-            w.set_iodef(self.config.io_default_mode);
-        });
-
-        // Start the acquisition
-        T::REGS.cr().modify(|w| {
-            w.set_start(true);
-        });
-    }
-
-    /// Stop charge transfer acquisition
-    pub fn stop(&mut self) {
-        T::REGS.cr().modify(|w| {
-            w.set_start(false);
-        });
-
-        // Set the touch sensing IOs in low power mode
-        T::REGS.cr().modify(|w| {
-            w.set_iodef(false);
-        });
-
-        // Clear flags
-        T::REGS.icr().modify(|w| {
-            w.set_eoaic(true);
-            w.set_mceic(true);
-        });
-
-        self.state = State::Ready;
-    }
-
-    /// Stop charge transfer acquisition and clear interrupts
-    pub fn stop_it(&mut self) {
-        T::REGS.cr().modify(|w| {
-            w.set_start(false);
-        });
-
-        // Set the touch sensing IOs in low power mode
-        T::REGS.cr().modify(|w| {
-            w.set_iodef(false);
-        });
-
-        // Disable interrupts
-        T::REGS.ier().modify(|w| {
-            w.set_eoaie(false);
-            w.set_mceie(false);
-        });
-
-        // Clear flags
-        T::REGS.icr().modify(|w| {
-            w.set_eoaic(true);
-            w.set_mceic(true);
-        });
-
-        self.state = State::Ready;
-    }
-
-    /// Wait for end of acquisition
-    pub fn poll_for_acquisition(&mut self) {
-        while self.get_state() == State::Busy {}
-    }
-
-    /// Get current state of acquisition
-    pub fn get_state(&mut self) -> State {
-        if self.state == State::Busy {
-            if T::REGS.isr().read().eoaf() {
-                if T::REGS.isr().read().mcef() {
-                    self.state = State::Error
-                } else {
-                    self.state = State::Ready
-                }
-            }
-        }
-        self.state
     }
 
     /// Get the individual group status to check acquisition complete
@@ -865,16 +740,27 @@ impl<'d, T: Instance> Tsc<'d, T> {
     }
 
     /// Get the count for the acquisiton, valid once group status is set
-    pub fn group_get_value(&mut self, index: Group) -> u16 {
-        T::REGS.iogcr(index.into()).read().cnt()
-    }
-
-    /// Discharge the IOs for subsequent acquisition
-    pub fn discharge_io(&mut self, status: bool) {
-        // Set the touch sensing IOs in low power mode
+    pub async fn read_group_value(&mut self, index: Group) -> u16 {
+        // Start the acquisition
         T::REGS.cr().modify(|w| {
-            w.set_iodef(!status);
+            w.set_start(true);
         });
+
+        poll_fn(|cx| {
+            T::state().waker.register(cx.waker());
+
+            if T::REGS.isr().read().eoaf() {
+                // Make sure the interrupt is cleared
+                T::REGS.icr().modify(|w| w.set_eoaic(true));
+                T::REGS.ier().modify(|w| w.set_eoaie(true));
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        T::REGS.iogcr(index.into()).read().cnt()
     }
 }
 
@@ -884,21 +770,68 @@ impl<'d, T: Instance> Drop for Tsc<'d, T> {
     }
 }
 
-pub(crate) trait SealedInstance {
-    const REGS: Regs;
+#[allow(missing_docs)]
+pub struct InterruptHandler<T: Instance> {
+    _phantom: PhantomData<T>,
 }
 
-/// TSC instance trait
-#[allow(private_bounds)]
-pub trait Instance: Peripheral<P = Self> + SealedInstance + RccPeripheral {}
-
-foreach_peripheral!(
-    (tsc, $inst:ident) => {
-        impl SealedInstance for peripherals::$inst {
-            const REGS: Regs = crate::pac::$inst;
+impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
+    unsafe fn on_interrupt() {
+        if T::REGS.isr().read().eoaf() {
+            T::REGS.ier().modify(|w| w.set_eoaie(false));
+        } else {
+            return;
         }
 
-        impl Instance for peripherals::$inst {}
+        T::state().waker.wake();
+    }
+}
+
+pub(crate) mod sealed {
+    use embassy_sync::waitqueue::AtomicWaker;
+
+    use crate::pac::tsc::Tsc as Regs;
+
+    pub struct State {
+        pub waker: AtomicWaker,
+    }
+
+    impl State {
+        pub const fn new() -> Self {
+            Self {
+                waker: AtomicWaker::new(),
+            }
+        }
+    }
+
+    pub trait InterruptableInstance {
+        type Interrupt: crate::interrupt::typelevel::Interrupt;
+    }
+    pub(crate) trait Instance: InterruptableInstance {
+        const REGS: Regs;
+        fn state() -> &'static State;
+    }
+}
+/// TSC instance trait
+#[allow(private_bounds)]
+pub trait Instance: Peripheral<P = Self> + sealed::Instance + RccPeripheral {}
+
+foreach_interrupt!(
+    ($inst:ident,tsc,TSC,GLOBAL,$irq:ident) => {
+        impl crate::tsc::sealed::Instance for peripherals::$inst {
+            const REGS: Regs = crate::pac::$inst;
+
+            fn state() -> &'static sealed::State {
+                static STATE: sealed::State = sealed::State::new();
+                &STATE
+            }
+        }
+
+        impl sealed::InterruptableInstance for peripherals::$inst {
+            type Interrupt = crate::interrupt::typelevel::$irq;
+        }
+
+        impl crate::tsc::Instance for peripherals::$inst {}
     };
 );
 
