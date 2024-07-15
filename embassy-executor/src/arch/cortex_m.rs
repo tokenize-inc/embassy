@@ -149,34 +149,43 @@ mod thread {
             let mut _load: f32 = 0.0;
             let mut ticker = 0;
 
+            // Suspend sys tick.
+            // Enable deep sleep
+            //let cp = cortex_m::Peripherals::take().unwrap();
+            //let mut scb = cp.SCB;
+            //scb.set_sleepdeep();
+            // Enter low power
+            //let dp = pac::Peripherals::take().unwrap();
+            //let mut pwr = dp.PWR;
+            //pwr.cr.write(|w| {
+            //    w.pdds().standby_mode();
+            //    w.cwuf().set_bit()
+            //});
+
             loop {
                 unsafe {
                     ticker += 1;
                     self.inner.poll();
-
-                    //cortex_m::interrupt::disable();
 
                     // Enable the debug registers
                     const LAR: *mut u32 = 0xE000_1FB0usize as _;
                     let lar = 0xC5AC_CE55;
                     core::ptr::write_volatile(LAR, lar);
 
-                    _working_time += core::ptr::read_volatile(DWT_CYCCNT) - _l;
-                    _t = core::ptr::read_volatile(DWT_CYCCNT);
-
-                    asm!("sev");
-                    asm!("wfe");
+                    _working_time += core::ptr::read_volatile(DWT_CYCCNT);
+                    //_t = core::ptr::read_volatile(DWT_CYCCNT);
+                    core::ptr::write_volatile(DWT_CYCCNT, 0);
                     asm!("wfe");
 
-                    _sleeping_time += core::ptr::read_volatile(DWT_CYCCNT) - _t;
-                    _l = core::ptr::read_volatile(DWT_CYCCNT);
-
-                    //cortex_m::interrupt::enable();
+                    _sleeping_time += core::ptr::read_volatile(DWT_CYCCNT);
+                    //_l = core::ptr::read_volatile(DWT_CYCCNT);
 
                     if ticker >= 1000 {
-                        _load = (_working_time as f32 / _sleeping_time as f32) as f32;
-                        defmt::debug!("W: {} S: {} L: {}%", _working_time, _sleeping_time, _load);
+                        _load = (_working_time as f32 / (_working_time + _sleeping_time) as f32) as f32;
+                        defmt::debug!("W: {} S: {} L: {}%", _working_time, _sleeping_time, _load * 100.0);
                         ticker = 0;
+                        _sleeping_time = 0;
+                        _working_time = 0;
                     }
                 };
             }
