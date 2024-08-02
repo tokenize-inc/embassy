@@ -39,7 +39,7 @@ static PKA_WAKER: AtomicWaker = AtomicWaker::new();
 #[repr(u8)]
 #[derive(Copy, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-enum PkaOperationMode {
+pub enum PkaOperationMode {
     /// Montgomery Parameter Computation then Modular Exponentiation
     ModularExponentiation = 0b000000,
     /// Montgomery Parameter Computation Only
@@ -256,7 +256,10 @@ impl<'d, T: Instance> Pka<'d, T> {
         Ok(())
     }
 
-    fn get_result(&mut self, mode: PkaOperationMode, result: &mut [u8]) -> PkaResult<usize> {
+    /// Read PKA operation result from its RAM
+    ///
+    /// Returns result length if success
+    pub fn get_result(&mut self, mode: PkaOperationMode, result: &mut [u8]) -> PkaResult<usize> {
         let (offset, length) = match mode {
             // NOTE: Some of the branches should be never reached since not all PKA operations are
             // implemented.
@@ -372,10 +375,12 @@ impl<'d, T: Instance> Pka<'d, T> {
     }
 
     /// Modular Reduction: A mod n
+    /// This method sets the parameters and starts the operations. Result can be retrieved with
+    /// `get_result` method.
     /// Modulus length in bits must be 8 < mod_len_bits < 3136, modulus have to be odd integer
     /// Operand A must fit into: 0 <= A < 2n < 2^3136
-    /// Returns result length if success
-    pub async fn mod_reduction(&mut self, operand: &[u8], modulus: &[u8], result: &mut [u8]) -> PkaResult<usize> {
+    /// Returns PKA operation mode if success (needed for reading result)
+    pub async fn mod_reduction_start(&mut self, operand: &[u8], modulus: &[u8]) -> PkaResult<PkaOperationMode> {
         if operand.len() > INPUT_OPERAND_MAX_SIZE || modulus.len() > INPUT_OPERAND_MAX_SIZE || modulus.len() < 1 {
             return Err(PkaError::InvalidInputParameter);
         }
@@ -387,28 +392,49 @@ impl<'d, T: Instance> Pka<'d, T> {
         // TODO: Why I need add larger padding to modulus to make it working?
         self.ram_write_param(ARITMETIC_OPERAND2_ADDR, modulus, operand_padding(modulus) + 4)?;
 
+        // let operand_size = modulus.len().max(operand.len());
+        // let operand_size_bits = (operand_size as u32) * u8::BITS ;
+        //
+        // self.ram_write_u32(MODULUS_LENGTH_ADDR, operand_size_bits);
+        // self.ram_write_u32(OPERAND_LENGTH_ADDR, operand_size_bits);
+        //
+        // let operand_padding = (4 - operand_size % 4) % 4;
+        // self.ram_write_param(ARITMETIC_OPERAND1_ADDR, operand, operand_size + operand_padding - operand.len())?;
+        // self.ram_write_param(ARITMETIC_OPERAND2_ADDR, modulus, operand_size + operand_padding - modulus.len())?;
+
         let mode = PkaOperationMode::ModularReduction;
         self.set_mode(mode);
         self.start().await;
 
+        Ok(mode)
+    }
+
+    /// Modular Reduction: A mod n
+    /// Modulus length in bits must be 8 < mod_len_bits < 3136, modulus have to be odd integer
+    /// Operand A must fit into: 0 <= A < 2n < 2^3136
+    /// Returns result length if success
+    pub async fn mod_reduction(&mut self, operand: &[u8], modulus: &[u8], result: &mut [u8]) -> PkaResult<usize> {
+        let mode = self.mod_reduction_start(operand, modulus).await?;
         self.get_result(mode, result)
     }
 
     /// Calculate the modular exponentiation A^e mod n
+    /// This method sets the parameters and starts the operations. Result can be retrieved with
+    /// `get_result` method.
     /// Modes:
     ///    r2_mod_n is None => Normal Mode
     ///    r2_mod_n is Some => Fast Mode
     /// Operand A have to be 0 <= A < n
     /// Exponent e have to be 0 <= e < n
     /// Modulus n have to be odd integer and n < 2^3136
-    pub async fn mod_exponent(
+    /// Returns PKA operation mode if success (needed for reading result)
+    pub async fn mod_exponent_start(
         &mut self,
         operand: &[u8],
         exponent: &[u8],
         modulus: &[u8],
         r2_mod_n: Option<&[u8]>,
-        result: &mut [u8],
-    ) -> PkaResult<usize> {
+    ) -> PkaResult<PkaOperationMode> {
         if operand.len() > INPUT_OPERAND_MAX_SIZE
             || exponent.len() > INPUT_OPERAND_MAX_SIZE
             || modulus.len() > INPUT_OPERAND_MAX_SIZE
@@ -437,6 +463,25 @@ impl<'d, T: Instance> Pka<'d, T> {
         self.set_mode(mode);
         self.start().await;
 
+        Ok(mode)
+    }
+
+    /// Calculate the modular exponentiation A^e mod n
+    /// Modes:
+    ///    r2_mod_n is None => Normal Mode
+    ///    r2_mod_n is Some => Fast Mode
+    /// Operand A have to be 0 <= A < n
+    /// Exponent e have to be 0 <= e < n
+    /// Modulus n have to be odd integer and n < 2^3136
+    pub async fn mod_exponent(
+        &mut self,
+        operand: &[u8],
+        exponent: &[u8],
+        modulus: &[u8],
+        r2_mod_n: Option<&[u8]>,
+        result: &mut [u8],
+    ) -> PkaResult<usize> {
+        let mode = self.mod_exponent_start(operand, exponent, modulus, r2_mod_n).await?;
         self.get_result(mode, result)
     }
 
