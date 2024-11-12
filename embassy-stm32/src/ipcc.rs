@@ -102,6 +102,31 @@ impl Ipcc {
     /// Enable IPCC.
     pub fn enable(_config: Config) {
         rcc::enable_and_reset::<IPCC>();
+
+        /* Such as IPCC IP available to the CPU2, it is required to keep the IPCC clock running
+         * when FUS is running on CPU2 and CPU1 enters deep sleep mode */
+        crate::pac::RCC.c2ahb3enr().modify(|w| w.set_ipccen(true));
+
+        // When the device is out of standby, it is required to use the EXTI mechanism to wakeup CPU2
+        crate::pac::EXTI
+            .cpu(1)
+            .emr(1)
+            .write_value(stm32_metapac::exti::regs::Lines(0x00000200 as u32));
+
+        crate::pac::EXTI
+            .rtsr(1)
+            .write_value(stm32_metapac::exti::regs::Lines(0x00000200 as u32));
+
+        /* In case the SBSFU is implemented, it may have already set the C2BOOT bit to startup the CPU2.
+         * In that case, to keep the mechanism transparent to the user application, it shall call the system command
+         * SHCI_C2_Reinit( ) before jumping to the application.
+         * When the CPU2 receives that command, it waits for its event input to be set to restart the CPU2 firmware.
+         * This is required because once C2BOOT has been set once, a clear/set on C2BOOT has no effect.
+         * When SHCI_C2_Reinit( ) is not called, generating an event to the CPU2 does not have any effect
+         * So, by default, the application shall both set the event flag and set the C2BOOT bit. */
+        cortex_m::asm::sev(); /* Set the internal event flag and send an event to the CPU2 */
+        cortex_m::asm::wfe(); /* Clear the internal event flag */
+
         IPCC::set_cpu2(true);
 
         // set RF wake-up clock = LSE
