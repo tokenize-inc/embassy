@@ -301,11 +301,73 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, const IV_SIZE: usize,
 
     fn reverse_bytes_in_words<const SIZE: usize>(block: &mut [u8; SIZE]) {
         assert_eq!(SIZE % 4, 0);
-        
+
         let words = block.array_chunks_mut::<4>();
         for word in words {
             word.reverse();
         }
+    }
+}
+
+/// AES-GCM Cipher Mode
+pub struct AesGcm<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn: 'static, DmaOut: 'static> {
+    aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
+    key: &'c [u8; KEY_SIZE],
+    payload_len: usize,
+    iv: [u8; 16],
+    dir: Direction,
+}
+
+impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, DmaOut>
+    AesGcm<'c, 'd, KEY_SIZE, TAG_SIZE, T, DmaIn, DmaOut>
+{
+    /// Constructs a new AES-GCM cipher for a cryptographic operation.
+    pub fn new(
+        aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
+        key: &'c [u8; KEY_SIZE],
+        nonce: &'c [u8; 12],
+        payload_len: usize,
+        dir: Direction,
+    ) -> Self {
+        // Reset the peripheral to ensure it's in a clean state
+        rcc::enable_and_reset::<T>();
+        let mut iv = [0u8; 16];
+        Self::setup_iv(&mut iv, nonce);
+
+        return Self {
+            aes,
+            key,
+            iv,
+            payload_len,
+            dir,
+        };
+    }
+
+    fn setup_iv(iv: &mut [u8; 16], nonce: &'c [u8; 12]) {
+        iv[0..12].copy_from_slice(nonce);
+        iv[12..16].copy_from_slice(&2u32.to_be_bytes());
+    }
+
+    /// Starts AES GCM cipher operation.
+    ///
+    /// Operations done in scope of this are ordered exactly as described
+    /// in RM0434 Rev 13, p. 611
+    pub async fn start(&mut self)
+    where
+        Self: CipherSized + IVSized,
+        DmaIn: crate::aes::DmaIn<T>,
+        DmaOut: crate::aes::DmaOut<T>,
+    {
+        self.aes.disable();
+        self.aes.set_gcm_chmod();
+        self.aes.set_byte_datatype();
+        self.aes.set_algorithm_phase(Gcmph::INITPHASE);
+        self.aes.setup_direction(self.dir);
+        self.aes.setup_key_register(self.key);
+        self.aes.setup_iv_register(&self.iv);
+        self.aes.enable();
+        self.aes.wait_until_computation_complete_blocking();
+        self.aes.clear_computation_complete_flag();
     }
 }
 
@@ -434,6 +496,11 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
         T::regs().cr().modify(|w| w.set_chmod2(true));
     }
 
+    fn set_gcm_chmod(&mut self) {
+        T::regs().cr().modify(|w| w.set_chmod10(11));
+        T::regs().cr().modify(|w| w.set_chmod2(false));
+    }
+
     fn set_byte_datatype(&mut self) {
         T::regs().cr().modify(|w| w.set_datatype(Datatype::BYTE));
     }
@@ -477,7 +544,7 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
             .for_each(|(i, &word)| T::regs().keyr(i).modify(|w| w.set_key(u32::from_be_bytes(word))));
     }
 
-    /// Fills key register with provided IV.
+    /// Fills IV register with provided IV.
     /// ## Contracts
     /// - Order of words in provided array: most significant word first, least significant word last.
     /// - Order of bytes in word: most significant byte first, least significant byte last.
@@ -587,7 +654,6 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
         }
     }
 
-
     /// Performs writing to DINR, and awaits without blocking,
     /// due to using AES CCF interrupts.
     #[allow(unused)]
@@ -653,14 +719,12 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
         if blocks.len() == 0 {
             return;
         }
-        
+
         // Ensure input is a multiple of block size.
         assert_eq!(blocks.len() % AES_BLOCK_SIZE, 0);
         // Configure DMA to transfer input to crypto core.
         let dma_request = dma_in.request();
-        let dst_ptr =T::regs().dinr().as_ptr() as *mut u32;
-
-
+        let dst_ptr = T::regs().dinr().as_ptr() as *mut u32;
 
         let num_words = blocks.len() / 4;
         let src_ptr = core::ptr::slice_from_raw_parts(blocks.as_ptr().cast(), num_words);
