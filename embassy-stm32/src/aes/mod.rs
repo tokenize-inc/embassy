@@ -316,6 +316,7 @@ pub struct AesGcm<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Insta
     payload_len: usize,
     iv: [u8; 16],
     dir: Direction,
+    aad_processed: bool,
 }
 
 impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, DmaOut>
@@ -340,6 +341,7 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
             iv,
             payload_len,
             dir,
+            aad_processed: false,
         };
     }
 
@@ -354,7 +356,6 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
     /// in RM0434 Rev 13, p. 611
     pub async fn start(&mut self)
     where
-        Self: CipherSized + IVSized,
         DmaIn: crate::aes::DmaIn<T>,
         DmaOut: crate::aes::DmaOut<T>,
     {
@@ -368,6 +369,153 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
         self.aes.enable();
         self.aes.wait_until_computation_complete_blocking();
         self.aes.clear_computation_complete_flag();
+
+        #[cfg(feature = "defmt")]
+        self.aes.log_aes_state();
+    }
+
+    /// Sets up authenticated associated data on the AES peripheral.
+    ///
+    /// Invariant: can be called only **once** per single decryption/encryption procedure
+    pub async fn aad(&mut self, aad: &[u8])
+    where
+        DmaIn: crate::aes::DmaIn<T>,
+        DmaOut: crate::aes::DmaOut<T>,
+    {
+        self.aad_processed = true;
+
+        let mut aad_buffer: [u8; 16] = [0; 16];
+        let mut aad_buffer_idx = 0;
+        self.aes.set_algorithm_phase(Gcmph::HEADERPHASE);
+
+        self.aes.enable();
+
+        // let header = self.get_header_block();
+        // aad_buffer[0..header.len()].copy_from_slice(header);
+        // aad_buffer_idx += header.len();
+
+        let mut processed_aad_len = 0;
+
+        while processed_aad_len < aad.len() {
+            let remaining_aad_len = aad.len() - processed_aad_len;
+            let remaining_buffer_len = AES_BLOCK_SIZE - aad_buffer_idx;
+
+            // Fill buffer with as much data from aad as possible.
+            let len_to_copy = core::cmp::min(remaining_aad_len, remaining_buffer_len);
+            aad_buffer[aad_buffer_idx..aad_buffer_idx + len_to_copy]
+                .copy_from_slice(&aad[processed_aad_len..processed_aad_len + len_to_copy]);
+            aad_buffer_idx += len_to_copy;
+            processed_aad_len += len_to_copy;
+
+            // In case we didn't fill whole buffer ( i.e. whole aad has already been processed),
+            // fill the remaining space with 0s.
+            aad_buffer[aad_buffer_idx..].fill(0);
+
+            Aes::<T, DmaIn, DmaOut>::write_bytes_dma(&mut self.aes.dma_in, &mut aad_buffer).await;
+
+            // Reset the buffer idx for the next block processing
+            aad_buffer_idx = 0;
+        }
+    }
+
+    /// Performs encryption/decryption on provided payload.
+    ///
+    /// ## Contracts
+    /// - Output buffer must be at least as long as the input buffer.
+    /// - `aad` should be called beforehand, if `aad_len` has been set to nonzero value.
+    ///
+    /// **Panics** if either of them is not upheld.
+    pub async fn payload(&mut self, input: &[u8], output: &mut [u8])
+    where
+        DmaIn: crate::aes::DmaIn<T>,
+        DmaOut: crate::aes::DmaOut<T>,
+    {
+        if input.len() > output.len() {
+            panic!("Output buffer length must match input length.");
+        }
+        if !self.aad_processed {
+            panic!("AES payload processing failed: AAD was supposed to be processed first")
+        }
+
+        self.aes.set_algorithm_phase(Gcmph::PAYLOADPHASE);
+
+        // This enable use is only meaningful when there's no AAD phase beforehand.
+        self.aes.enable();
+
+        let input_len_remainder = self.payload_len % AES_BLOCK_SIZE;
+
+        let mut idx: usize = 0;
+        let full_blocks_len = self.payload_len - input_len_remainder;
+        self.aes
+            .write_read_bytes_dma(
+                &input[idx..idx + full_blocks_len],
+                &mut output[idx..idx + full_blocks_len],
+            )
+            .await;
+
+        idx += full_blocks_len;
+
+        if input_len_remainder > 0 {
+            // Set up npblb so that AES knows to skip some trailing bytes
+            if self.dir == Direction::Decrypt {
+                let padding_len = AES_BLOCK_SIZE - input_len_remainder;
+                T::regs().cr().modify(|w| w.set_npblb(padding_len as u8));
+            }
+
+            // Copy remaining message to the front, the rest SHOULD be 0s
+            let mut in_buffer: [u8; 16] = [0; 16];
+            in_buffer[..input_len_remainder].copy_from_slice(&input[idx..idx + input_len_remainder]);
+
+            // Blocking read and write has a different endianness than DMA, hence we need to reverse the byte order
+            // before and after the operation
+            Self::reverse_bytes_in_words(&mut in_buffer);
+
+            // We're falling back to polling data transfer,
+            // so CCF needs to be manually reset after DMA usage
+            self.aes.clear_computation_complete_flag();
+
+            let mut out_buffer = [0; 16];
+            self.aes.write_and_read_bytes_blocking(&in_buffer, &mut out_buffer);
+
+            // Blocking read and write has a different endianness than DMA, hence we need to reverse the byte order
+            // before and after the operation
+            Self::reverse_bytes_in_words(&mut out_buffer);
+
+            output[idx..idx + input_len_remainder].copy_from_slice(&out_buffer[..input_len_remainder]);
+        }
+    }
+
+    /// Generates an authentication tag for authenticated ciphers including GCM, CCM, and GMAC.
+    /// Called after the all data has been encrypted/decrypted by `payload`.
+    pub async fn finish(&mut self) -> [u8; TAG_SIZE] {
+        // We're falling back to polling data transfer,
+        // so CCF needs to be manually reset after DMA usage
+        self.aes.clear_computation_complete_flag();
+        self.aes.set_algorithm_phase(Gcmph::FINALPHASE);
+
+        let mut full_tag: [u8; 16] = [0; 16];
+
+        self.aes.read_bytes_blocking(&mut full_tag);
+
+        // Data swapping is **not** applied to the tag,
+        // hence we do it ourselves
+        Self::reverse_bytes_in_words(&mut full_tag);
+
+        let mut tag: [u8; TAG_SIZE] = [0; TAG_SIZE];
+        tag.copy_from_slice(&full_tag[0..TAG_SIZE]);
+
+        self.aes.disable();
+
+        tag
+    }
+
+    fn reverse_bytes_in_words<const SIZE: usize>(block: &mut [u8; SIZE]) {
+        assert_eq!(SIZE % 4, 0);
+
+        let words = block.array_chunks_mut::<4>();
+        for word in words {
+            word.reverse();
+        }
     }
 }
 
