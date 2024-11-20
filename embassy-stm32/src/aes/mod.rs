@@ -313,6 +313,7 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, const IV_SIZE: usize,
 pub struct AesGcm<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn: 'static, DmaOut: 'static> {
     aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
     key: &'c [u8; KEY_SIZE],
+    aad_len: usize,
     payload_len: usize,
     iv: [u8; 16],
     dir: Direction,
@@ -327,6 +328,7 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
         aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
         key: &'c [u8; KEY_SIZE],
         nonce: &'c [u8; 12],
+        aad_len: usize,
         payload_len: usize,
         dir: Direction,
     ) -> Self {
@@ -339,6 +341,7 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
             aes,
             key,
             iv,
+            aad_len,
             payload_len,
             dir,
             aad_processed: false,
@@ -347,7 +350,7 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
 
     fn setup_iv(iv: &mut [u8; 16], nonce: &'c [u8; 12]) {
         iv[0..12].copy_from_slice(nonce);
-        iv[12..16].copy_from_slice(&2u32.to_be_bytes());
+        iv[12..16].copy_from_slice(&0x2u32.to_be_bytes());
     }
 
     /// Starts AES GCM cipher operation.
@@ -390,10 +393,6 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
 
         self.aes.enable();
 
-        // let header = self.get_header_block();
-        // aad_buffer[0..header.len()].copy_from_slice(header);
-        // aad_buffer_idx += header.len();
-
         let mut processed_aad_len = 0;
 
         while processed_aad_len < aad.len() {
@@ -409,9 +408,10 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
 
             // In case we didn't fill whole buffer ( i.e. whole aad has already been processed),
             // fill the remaining space with 0s.
+            // this does nothing if `aad_buffer_idx == aad_buffer.len()``
             aad_buffer[aad_buffer_idx..].fill(0);
 
-            Aes::<T, DmaIn, DmaOut>::write_bytes_dma(&mut self.aes.dma_in, &mut aad_buffer).await;
+            self.aes.write_bytes_blocking(&mut aad_buffer);
 
             // Reset the buffer idx for the next block processing
             aad_buffer_idx = 0;
@@ -433,7 +433,7 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
         if input.len() > output.len() {
             panic!("Output buffer length must match input length.");
         }
-        if !self.aad_processed {
+        if !self.aad_processed && self.aad_len > 0 {
             panic!("AES payload processing failed: AAD was supposed to be processed first")
         }
 
@@ -447,40 +447,25 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
         let mut idx: usize = 0;
         let full_blocks_len = self.payload_len - input_len_remainder;
         self.aes
-            .write_read_bytes_dma(
+            .write_and_read_bytes_blocking(
                 &input[idx..idx + full_blocks_len],
                 &mut output[idx..idx + full_blocks_len],
-            )
-            .await;
+            );
 
         idx += full_blocks_len;
 
         if input_len_remainder > 0 {
             // Set up npblb so that AES knows to skip some trailing bytes
-            if self.dir == Direction::Decrypt {
+            if self.dir == Direction::Encrypt {
                 let padding_len = AES_BLOCK_SIZE - input_len_remainder;
                 T::regs().cr().modify(|w| w.set_npblb(padding_len as u8));
             }
 
-            // Copy remaining message to the front, the rest SHOULD be 0s
             let mut in_buffer: [u8; 16] = [0; 16];
-            in_buffer[..input_len_remainder].copy_from_slice(&input[idx..idx + input_len_remainder]);
-
-            // Blocking read and write has a different endianness than DMA, hence we need to reverse the byte order
-            // before and after the operation
-            Self::reverse_bytes_in_words(&mut in_buffer);
-
-            // We're falling back to polling data transfer,
-            // so CCF needs to be manually reset after DMA usage
-            self.aes.clear_computation_complete_flag();
-
             let mut out_buffer = [0; 16];
+            // Copy remaining message to the front, the rest SHOULD be 0s
+            in_buffer[..input_len_remainder].copy_from_slice(&input[idx..idx + input_len_remainder]);
             self.aes.write_and_read_bytes_blocking(&in_buffer, &mut out_buffer);
-
-            // Blocking read and write has a different endianness than DMA, hence we need to reverse the byte order
-            // before and after the operation
-            Self::reverse_bytes_in_words(&mut out_buffer);
-
             output[idx..idx + input_len_remainder].copy_from_slice(&out_buffer[..input_len_remainder]);
         }
     }
@@ -488,18 +473,37 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
     /// Generates an authentication tag for authenticated ciphers including GCM, CCM, and GMAC.
     /// Called after the all data has been encrypted/decrypted by `payload`.
     pub async fn finish(&mut self) -> [u8; TAG_SIZE] {
+
+
         // We're falling back to polling data transfer,
         // so CCF needs to be manually reset after DMA usage
         self.aes.clear_computation_complete_flag();
         self.aes.set_algorithm_phase(Gcmph::FINALPHASE);
 
-        let mut full_tag: [u8; 16] = [0; 16];
 
-        self.aes.read_bytes_blocking(&mut full_tag);
+        const CHUNK_SIZE: usize = 4;
+        let mut last_block: [u8; 4 * CHUNK_SIZE] = [0; 4 * CHUNK_SIZE];
+        let last_block_chunks = last_block.as_chunks_mut::<CHUNK_SIZE>().0;
+        let aad_len_chunk = last_block_chunks
+            .get_mut(1)
+            .expect("There should be four 32 bytes long chunks in 128 array");
+        *aad_len_chunk = (8* self.aad_len).to_be_bytes();
+        let payload_len_chunk = last_block_chunks
+            .get_mut(3)
+            .expect("There should be four 32 bytes long chunks in 128 array");
+        *payload_len_chunk = (8* self.payload_len).to_be_bytes();
+
+        // Self::reverse_bytes_in_words(&mut last_block);
+        #[cfg(feature = "defmt")]
+        defmt::info!("Last block: {=[u8]:x}", last_block);
+
+
+        let mut full_tag: [u8; 16] = [0; 16];
+        self.aes.write_and_read_bytes_blocking(&last_block, &mut full_tag);
 
         // Data swapping is **not** applied to the tag,
         // hence we do it ourselves
-        Self::reverse_bytes_in_words(&mut full_tag);
+        // Self::reverse_bytes_in_words(&mut full_tag);
 
         let mut tag: [u8; TAG_SIZE] = [0; TAG_SIZE];
         tag.copy_from_slice(&full_tag[0..TAG_SIZE]);
@@ -650,7 +654,7 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
     }
 
     fn set_byte_datatype(&mut self) {
-        T::regs().cr().modify(|w| w.set_datatype(Datatype::BYTE));
+        T::regs().cr().modify(|w| w.set_datatype(Datatype::NONE));
     }
 
     /// Sets the phase of the algorithm that the processor is in.
@@ -685,7 +689,15 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
     /// - Order of words in provided array: most significant word first, least significant word last.
     /// - Order of bytes in word: most significant byte first, least significant byte last.
     fn setup_key_register<const N: usize>(&mut self, key: &[u8; N]) {
-        key // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15]
+        if N == 32 {
+            T::regs().cr().modify(|x| x.set_keysize(true));
+        } else if N == 16 {
+            T::regs().cr().modify(|x| x.set_keysize(false));
+        } else {
+            panic!("Incorrect AES key size")
+        }
+        
+        key // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16]
             .array_chunks::<4>() // [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]
             .rev() // [[13, 14, 15, 16], [9, 10, 11, 12], [5, 6, 7, 8], [1, 2, 3, 4]]
             .enumerate() // [(0, [13, 14, 15, 16]),  (1, [9, 10, 11, 12]),  (2, [5, 6, 7, 8]),  (3, [1, 2, 3, 4])]
@@ -697,12 +709,20 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
     /// - Order of words in provided array: most significant word first, least significant word last.
     /// - Order of bytes in word: most significant byte first, least significant byte last.
     fn setup_iv_register(&mut self, full_iv: &[u8; 16]) {
+        
+        // let mut  full_iv = *full_iv;
+        // full_iv.reverse();
+
         //least significant word goes to IV register #0, most significant - IV register #3
         full_iv // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15]
             .array_chunks::<4>() // [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]
-            .rev() // [[13, 14, 15, 16], [9, 10, 11, 12], [5, 6, 7, 8], [1, 2, 3, 4]]
+            .rev()
             .enumerate() // [(0, [13, 14, 15, 16]),  (1, [9, 10, 11, 12]),  (2, [5, 6, 7, 8]),  (3, [1, 2, 3, 4])]
-            .for_each(|(i, &word)| T::regs().ivr(i).modify(|w| w.set_ivi(u32::from_be_bytes(word))));
+            .for_each(|(i, &word)|  {
+                // #[cfg(feature = "defmt")]
+                // defmt::info!("Inserting: {:X} into IV{}", u32::from_be_bytes(word), i);
+                T::regs().ivr(i).modify(|w| w.set_ivi(u32::from_be_bytes(word)));
+            });
     }
 
     #[cfg(feature = "defmt")]
@@ -738,6 +758,8 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
         {
             // write words from input slice into DINR, one after another
             for &word_in in block_in.array_chunks::<BYTES_IN_WORD>() {
+                // #[cfg(feature = "defmt")]
+                // defmt::info!(" Writing {=[u8]:X} into IN register", word_in);
                 T::regs().dinr().write(|w| w.set_din(u32::from_be_bytes(word_in)));
             }
 
@@ -747,7 +769,10 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
             // read the computation result words into the output slice, one after another
             for word_out in block_out.array_chunks_mut::<BYTES_IN_WORD>() {
                 let read_word = T::regs().doutr().read().dout();
+                
                 word_out.copy_from_slice(&read_word.to_be_bytes());
+                // #[cfg(feature = "defmt")]
+                // defmt::info!(" Taking {=[u8]:X} from OUT register", *word_out);
             }
 
             self.clear_computation_complete_flag();
