@@ -446,11 +446,10 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
 
         let mut idx: usize = 0;
         let full_blocks_len = self.payload_len - input_len_remainder;
-        self.aes
-            .write_and_read_bytes_blocking(
-                &input[idx..idx + full_blocks_len],
-                &mut output[idx..idx + full_blocks_len],
-            );
+        self.aes.write_and_read_bytes_blocking(
+            &input[idx..idx + full_blocks_len],
+            &mut output[idx..idx + full_blocks_len],
+        );
 
         idx += full_blocks_len;
 
@@ -473,22 +472,18 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
     /// Generates an authentication tag for authenticated ciphers including GCM, CCM, and GMAC.
     /// Called after the all data has been encrypted/decrypted by `payload`.
     pub async fn finish(&mut self) -> [u8; TAG_SIZE] {
-
-
         // We're falling back to polling data transfer,
         // so CCF needs to be manually reset after DMA usage
         self.aes.clear_computation_complete_flag();
         self.aes.set_algorithm_phase(Gcmph::FINALPHASE);
 
-
         const CHUNK_SIZE: usize = 4;
         let mut last_block: [u8; 4 * CHUNK_SIZE] = [0; 4 * CHUNK_SIZE];
         let last_block_chunks = last_block.as_chunks_mut::<CHUNK_SIZE>().0;
         let aad_len_chunk = &mut last_block_chunks[1];
-        *aad_len_chunk = (8* self.aad_len).to_be_bytes();
-        let payload_len_chunk = &mut  last_block_chunks[3];
-        *payload_len_chunk = (8* self.payload_len).to_be_bytes();
-
+        *aad_len_chunk = (8 * self.aad_len).to_be_bytes();
+        let payload_len_chunk = &mut last_block_chunks[3];
+        *payload_len_chunk = (8 * self.payload_len).to_be_bytes();
 
         let mut full_tag: [u8; 16] = [0; 16];
         self.aes.write_and_read_bytes_blocking(&last_block, &mut full_tag);
@@ -688,7 +683,7 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
         } else {
             panic!("Incorrect AES key size")
         }
-        
+
         key // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16]
             .array_chunks::<4>() // [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]
             .rev() // [[13, 14, 15, 16], [9, 10, 11, 12], [5, 6, 7, 8], [1, 2, 3, 4]]
@@ -701,7 +696,6 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
     /// - Order of words in provided array: most significant word first, least significant word last.
     /// - Order of bytes in word: most significant byte first, least significant byte last.
     fn setup_iv_register(&mut self, full_iv: &[u8; 16]) {
-        
         // let mut  full_iv = *full_iv;
         // full_iv.reverse();
 
@@ -710,7 +704,7 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
             .array_chunks::<4>() // [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]
             .rev() // [[13, 14, 15, 16], [9, 10, 11, 12], [5, 6, 7, 8], [1, 2, 3, 4]]
             .enumerate() // [(0, [13, 14, 15, 16]),  (1, [9, 10, 11, 12]),  (2, [5, 6, 7, 8]),  (3, [1, 2, 3, 4])]
-            .for_each(|(i, &word)|  {
+            .for_each(|(i, &word)| {
                 T::regs().ivr(i).modify(|w| w.set_ivi(u32::from_be_bytes(word)));
             });
     }
@@ -757,7 +751,7 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
             // read the computation result words into the output slice, one after another
             for word_out in block_out.array_chunks_mut::<BYTES_IN_WORD>() {
                 let read_word = T::regs().doutr().read().dout();
-                
+
                 word_out.copy_from_slice(&read_word.to_be_bytes());
             }
 
