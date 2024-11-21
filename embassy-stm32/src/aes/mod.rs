@@ -484,18 +484,10 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
         const CHUNK_SIZE: usize = 4;
         let mut last_block: [u8; 4 * CHUNK_SIZE] = [0; 4 * CHUNK_SIZE];
         let last_block_chunks = last_block.as_chunks_mut::<CHUNK_SIZE>().0;
-        let aad_len_chunk = last_block_chunks
-            .get_mut(1)
-            .expect("There should be four 32 bytes long chunks in 128 array");
+        let aad_len_chunk = &mut last_block_chunks[1];
         *aad_len_chunk = (8* self.aad_len).to_be_bytes();
-        let payload_len_chunk = last_block_chunks
-            .get_mut(3)
-            .expect("There should be four 32 bytes long chunks in 128 array");
+        let payload_len_chunk = &mut  last_block_chunks[3];
         *payload_len_chunk = (8* self.payload_len).to_be_bytes();
-
-        // Self::reverse_bytes_in_words(&mut last_block);
-        #[cfg(feature = "defmt")]
-        defmt::info!("Last block: {=[u8]:x}", last_block);
 
 
         let mut full_tag: [u8; 16] = [0; 16];
@@ -714,13 +706,11 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
         // full_iv.reverse();
 
         //least significant word goes to IV register #0, most significant - IV register #3
-        full_iv // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15]
+        full_iv // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16]
             .array_chunks::<4>() // [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]
-            .rev()
+            .rev() // [[13, 14, 15, 16], [9, 10, 11, 12], [5, 6, 7, 8], [1, 2, 3, 4]]
             .enumerate() // [(0, [13, 14, 15, 16]),  (1, [9, 10, 11, 12]),  (2, [5, 6, 7, 8]),  (3, [1, 2, 3, 4])]
             .for_each(|(i, &word)|  {
-                // #[cfg(feature = "defmt")]
-                // defmt::info!("Inserting: {:X} into IV{}", u32::from_be_bytes(word), i);
                 T::regs().ivr(i).modify(|w| w.set_ivi(u32::from_be_bytes(word)));
             });
     }
@@ -758,8 +748,6 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
         {
             // write words from input slice into DINR, one after another
             for &word_in in block_in.array_chunks::<BYTES_IN_WORD>() {
-                // #[cfg(feature = "defmt")]
-                // defmt::info!(" Writing {=[u8]:X} into IN register", word_in);
                 T::regs().dinr().write(|w| w.set_din(u32::from_be_bytes(word_in)));
             }
 
@@ -771,8 +759,6 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
                 let read_word = T::regs().doutr().read().dout();
                 
                 word_out.copy_from_slice(&read_word.to_be_bytes());
-                // #[cfg(feature = "defmt")]
-                // defmt::info!(" Taking {=[u8]:X} from OUT register", *word_out);
             }
 
             self.clear_computation_complete_flag();
