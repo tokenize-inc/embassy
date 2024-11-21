@@ -408,7 +408,7 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
 
             // In case we didn't fill whole buffer ( i.e. whole aad has already been processed),
             // fill the remaining space with 0s.
-            // this does nothing if `aad_buffer_idx == aad_buffer.len()``
+            // this does nothing if `aad_buffer_idx == aad_buffer.len()`
             aad_buffer[aad_buffer_idx..].fill(0);
 
             self.aes.write_bytes_blocking(&mut aad_buffer);
