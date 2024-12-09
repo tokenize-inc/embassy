@@ -310,7 +310,16 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, const IV_SIZE: usize,
 }
 
 /// AES-GCM Cipher Mode
-pub struct AesGcm<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn: 'static, DmaOut: 'static, KP: AesKeyManager> {
+pub struct AesGcm<
+    'c,
+    'd,
+    const KEY_SIZE: usize,
+    const TAG_SIZE: usize,
+    T: Instance,
+    DmaIn: 'static,
+    DmaOut: 'static,
+    KP: AesKeyManager,
+> {
     aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
     key_manager: KP,
     aad_len: usize,
@@ -491,17 +500,100 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
         let mut tag: [u8; TAG_SIZE] = [0; TAG_SIZE];
         tag.copy_from_slice(&full_tag[0..TAG_SIZE]);
 
-
         self.aes.disable();
 
         self.key_manager.unload::<T>().await;
-        
+
         tag
     }
-
-   
 }
 
+/// AES-CBC Cipher Mode
+pub struct AesCbc<'c, 'd, const KEY_SIZE: usize, T: Instance, DmaIn: 'static, DmaOut: 'static> {
+    aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
+    key: &'c [u8; KEY_SIZE],
+    payload_len: usize,
+    iv: [u8; 16],
+    dir: Direction,
+}
+
+impl<'c, 'd, const KEY_SIZE: usize, T: Instance, DmaIn, DmaOut> AesCbc<'c, 'd, KEY_SIZE, T, DmaIn, DmaOut> {
+    /// Constructs a new AES-CBC cipher for a cryptographic operation.
+    pub fn new(
+        aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
+        key: &'c [u8; KEY_SIZE],
+        payload_len: usize,
+        iv: [u8; 16],
+        dir: Direction,
+    ) -> Self {
+        // Reset the peripheral to ensure it's in a clean state
+        rcc::enable_and_reset::<T>();
+        // let mut iv = [0u8; 16];
+        // Self::setup_iv(&mut iv, nonce);
+
+        return Self {
+            aes,
+            key,
+            iv,
+            payload_len,
+            dir,
+        };
+    }
+
+    pub async fn start(&mut self) {
+        self.aes.disable();
+        self.aes.set_cbc_chmod();
+        self.aes.setup_direction(self.dir);
+        self.aes.setup_key_register(self.key);
+        self.aes.setup_iv_register(&self.iv);
+        self.aes.enable();
+
+        #[cfg(feature = "defmt")]
+        self.aes.log_aes_state();
+    }
+
+    /// Performs encryption/decryption on provided payload.
+    ///
+    /// ## Contracts
+    /// - Output buffer must be at least as long as the input buffer.
+    ///
+    /// **Panics** if either of them is not upheld.
+    pub async fn payload(&mut self, input: &[u8], output: &mut [u8])
+    where
+        DmaIn: crate::aes::DmaIn<T>,
+        DmaOut: crate::aes::DmaOut<T>,
+    {
+        if input.len() > output.len() {
+            panic!("Output buffer length must match input length.");
+        }
+
+        let input_len_remainder = self.payload_len % AES_BLOCK_SIZE;
+
+        let mut idx: usize = 0;
+        let full_blocks_len = self.payload_len - input_len_remainder;
+        self.aes.write_and_read_bytes_blocking(
+            &input[idx..idx + full_blocks_len],
+            &mut output[idx..idx + full_blocks_len],
+        );
+
+        idx += full_blocks_len;
+
+        if input_len_remainder > 0 {
+            // Set up npblb so that AES knows to skip some trailing bytes
+            if self.dir == Direction::Encrypt {
+                let padding_len = AES_BLOCK_SIZE - input_len_remainder;
+                T::regs().cr().modify(|w| w.set_npblb(padding_len as u8));
+            }
+
+            let mut in_buffer: [u8; 16] = [0; 16];
+            let mut out_buffer = [0; 16];
+            // Copy remaining message to the front, the rest SHOULD be 0s
+            in_buffer[..input_len_remainder].copy_from_slice(&input[idx..idx + input_len_remainder]);
+            self.aes.write_and_read_bytes_blocking(&in_buffer, &mut out_buffer);
+            output[idx..idx + input_len_remainder].copy_from_slice(&out_buffer[..input_len_remainder]);
+        }
+    }
+}
 /// This trait enables restriction of ciphers to specific key sizes.
 pub trait CipherSized {}
 
@@ -629,6 +721,11 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
 
     fn set_gcm_chmod(&mut self) {
         T::regs().cr().modify(|w| w.set_chmod10(11));
+        T::regs().cr().modify(|w| w.set_chmod2(false));
+    }
+
+    fn set_cbc_chmod(&mut self) {
+        T::regs().cr().modify(|w| w.set_chmod10(01));
         T::regs().cr().modify(|w| w.set_chmod2(false));
     }
 
@@ -923,17 +1020,13 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
     }
 }
 
-
 pub trait AesKeyManager {
     async fn load<T: Instance>(&mut self);
 
-    async fn unload<T: Instance>(&mut self) {
-
-    }
+    async fn unload<T: Instance>(&mut self) {}
 }
 
-
-impl AesKeyManager for &[u8;16] {
+impl AesKeyManager for &[u8; 16] {
     /// Fills key register with provided key.
     /// ## Contracts
     /// - Order of words in provided array: most significant word first, least significant word last.
@@ -949,7 +1042,7 @@ impl AesKeyManager for &[u8;16] {
     }
 }
 
-impl AesKeyManager for &[u8;32] {
+impl AesKeyManager for &[u8; 32] {
     /// Fills key register with provided key.
     /// ## Contracts
     /// - Order of words in provided array: most significant word first, least significant word last.
