@@ -509,19 +509,19 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
 }
 
 /// AES-CBC Cipher Mode
-pub struct AesCbc<'c, 'd, const KEY_SIZE: usize, T: Instance, DmaIn: 'static, DmaOut: 'static> {
+pub struct AesCbc<'c, 'd, T: Instance, DmaIn: 'static, DmaOut: 'static, KM: AesKeyManager> {
     aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
-    key: &'c [u8; KEY_SIZE],
+    key_manager: KM,
     payload_len: usize,
     iv: [u8; 16],
     dir: Direction,
 }
 
-impl<'c, 'd, const KEY_SIZE: usize, T: Instance, DmaIn, DmaOut> AesCbc<'c, 'd, KEY_SIZE, T, DmaIn, DmaOut> {
+impl<'c, 'd, T: Instance, DmaIn, DmaOut, KM: AesKeyManager> AesCbc<'c, 'd, T, DmaIn, DmaOut, KM> {
     /// Constructs a new AES-CBC cipher for a cryptographic operation.
     pub fn new(
         aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
-        key: &'c [u8; KEY_SIZE],
+        key_manager: KM,
         payload_len: usize,
         iv: [u8; 16],
         dir: Direction,
@@ -533,7 +533,7 @@ impl<'c, 'd, const KEY_SIZE: usize, T: Instance, DmaIn, DmaOut> AesCbc<'c, 'd, K
 
         return Self {
             aes,
-            key,
+            key_manager,
             iv,
             payload_len,
             dir,
@@ -544,7 +544,7 @@ impl<'c, 'd, const KEY_SIZE: usize, T: Instance, DmaIn, DmaOut> AesCbc<'c, 'd, K
         self.aes.disable();
         self.aes.set_cbc_chmod();
         self.aes.setup_direction(self.dir);
-        self.aes.setup_key_register(self.key);
+        self.key_manager.load::<T>().await;
         self.aes.setup_iv_register(&self.iv);
         self.aes.enable();
 
