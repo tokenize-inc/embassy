@@ -540,16 +540,17 @@ impl<'c, 'd, T: Instance, DmaIn, DmaOut, KM: AesKeyManager> AesCbc<'c, 'd, T, Dm
         };
     }
 
-    pub async fn start(&mut self) {
+    pub async fn start(&mut self) -> Result<(), Error> {
         self.aes.disable();
         self.aes.set_cbc_chmod();
         self.aes.setup_direction(self.dir);
-        self.key_manager.load::<T>().await;
         self.aes.setup_iv_register(&self.iv);
+        self.key_manager.load::<T>().await?;
         self.aes.enable();
 
         #[cfg(feature = "defmt")]
         self.aes.log_aes_state();
+        Ok(())
     }
 
     /// Performs encryption/decryption on provided payload.
@@ -592,6 +593,10 @@ impl<'c, 'd, T: Instance, DmaIn, DmaOut, KM: AesKeyManager> AesCbc<'c, 'd, T, Dm
             self.aes.write_and_read_bytes_blocking(&in_buffer, &mut out_buffer);
             output[idx..idx + input_len_remainder].copy_from_slice(&out_buffer[..input_len_remainder]);
         }
+    }
+
+    pub async fn finalize(&mut self) -> Result<(), Error> {
+        self.key_manager.unload::<T>().await
     }
 }
 /// This trait enables restriction of ciphers to specific key sizes.
@@ -674,6 +679,11 @@ pub enum Direction {
     Encrypt,
     /// Decryption mode
     Decrypt,
+}
+
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Error {
+    KeyManagerError,
 }
 
 /// AES Accelerator Driver
@@ -1021,9 +1031,9 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
 }
 
 pub trait AesKeyManager {
-    async fn load<T: Instance>(&mut self);
+    async fn load<T: Instance>(&mut self) -> Result<(), Error>;
 
-    async fn unload<T: Instance>(&mut self) {}
+    async fn unload<T: Instance>(&mut self) -> Result<(), Error>;
 }
 
 impl AesKeyManager for &[u8; 16] {
@@ -1031,7 +1041,7 @@ impl AesKeyManager for &[u8; 16] {
     /// ## Contracts
     /// - Order of words in provided array: most significant word first, least significant word last.
     /// - Order of bytes in word: most significant byte first, least significant byte last.
-    async fn load<T: Instance>(&mut self) {
+    async fn load<T: Instance>(&mut self) -> Result<(), Error> {
         T::regs().cr().modify(|x| x.set_keysize(false));
 
         self // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16]
@@ -1039,6 +1049,11 @@ impl AesKeyManager for &[u8; 16] {
             .rev() // [[13, 14, 15, 16], [9, 10, 11, 12], [5, 6, 7, 8], [1, 2, 3, 4]]
             .enumerate() // [(0, [13, 14, 15, 16]),  (1, [9, 10, 11, 12]),  (2, [5, 6, 7, 8]),  (3, [1, 2, 3, 4])]
             .for_each(|(i, &word)| T::regs().keyr(i).modify(|w| w.set_key(u32::from_be_bytes(word))));
+        Ok(())
+    }
+
+    async fn unload<T: Instance>(&mut self) -> Result<(), Error> {
+        Ok(())
     }
 }
 
@@ -1047,7 +1062,7 @@ impl AesKeyManager for &[u8; 32] {
     /// ## Contracts
     /// - Order of words in provided array: most significant word first, least significant word last.
     /// - Order of bytes in word: most significant byte first, least significant byte last.
-    async fn load<T: Instance>(&mut self) {
+    async fn load<T: Instance>(&mut self) -> Result<(), Error> {
         T::regs().cr().modify(|x| x.set_keysize(true));
 
         self // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16]
@@ -1055,6 +1070,11 @@ impl AesKeyManager for &[u8; 32] {
             .rev() // [[13, 14, 15, 16], [9, 10, 11, 12], [5, 6, 7, 8], [1, 2, 3, 4]]
             .enumerate() // [(0, [13, 14, 15, 16]),  (1, [9, 10, 11, 12]),  (2, [5, 6, 7, 8]),  (3, [1, 2, 3, 4])]
             .for_each(|(i, &word)| T::regs().keyr(i).modify(|w| w.set_key(u32::from_be_bytes(word))));
+        Ok(())
+    }
+
+    async fn unload<T: Instance>(&mut self) -> Result<(), Error> {
+        Ok(())
     }
 }
 
