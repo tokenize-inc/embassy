@@ -366,7 +366,7 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
     ///
     /// Operations done in scope of this are ordered exactly as described
     /// in RM0434 Rev 13, p. 611
-    pub async fn start(&mut self)
+    pub async fn start(&mut self) -> Result<(), Error>
     where
         DmaIn: crate::aes::DmaIn<T>,
         DmaOut: crate::aes::DmaOut<T>,
@@ -376,7 +376,7 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
         self.aes.set_byte_datatype();
         self.aes.set_algorithm_phase(Gcmph::INITPHASE);
         self.aes.setup_direction(self.dir);
-        self.key_manager.load::<T>().await;
+        self.key_manager.load::<T>().await?;
         self.aes.setup_iv_register(&self.iv);
         self.aes.enable();
         self.aes.wait_until_computation_complete_blocking();
@@ -384,6 +384,8 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
 
         #[cfg(feature = "defmt")]
         self.aes.log_aes_state();
+
+        Ok(())
     }
 
     /// Sets up authenticated associated data on the AES peripheral.
@@ -480,7 +482,7 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
 
     /// Generates an authentication tag for authenticated ciphers including GCM, CCM, and GMAC.
     /// Called after the all data has been encrypted/decrypted by `payload`.
-    pub async fn finish(&mut self) -> [u8; TAG_SIZE] {
+    pub async fn finish(&mut self) -> Result<[u8; TAG_SIZE], Error> {
         // We're falling back to polling data transfer,
         // so CCF needs to be manually reset after DMA usage
         self.aes.clear_computation_complete_flag();
@@ -502,9 +504,9 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
 
         self.aes.disable();
 
-        self.key_manager.unload::<T>().await;
+        self.key_manager.unload::<T>().await?;
 
-        tag
+        Ok(tag)
     }
 }
 
@@ -540,6 +542,10 @@ impl<'c, 'd, T: Instance, DmaIn, DmaOut, KM: AesKeyManager> AesCbc<'c, 'd, T, Dm
         };
     }
 
+    /// Starts AES CBC cipher operation
+    ///
+    /// Operations done in scope of this are ordered exactly as described
+    /// in RM0434 Rev 13, p. 603
     pub async fn start(&mut self) -> Result<(), Error> {
         self.aes.disable();
         self.aes.set_cbc_chmod();
@@ -595,7 +601,9 @@ impl<'c, 'd, T: Instance, DmaIn, DmaOut, KM: AesKeyManager> AesCbc<'c, 'd, T, Dm
         }
     }
 
-    pub async fn finalize(&mut self) -> Result<(), Error> {
+    /// Unloads the key
+    /// Called after the all data has been encrypted/decrypted by `payload`.
+    pub async fn finish(&mut self) -> Result<(), Error> {
         self.key_manager.unload::<T>().await
     }
 }
@@ -681,8 +689,10 @@ pub enum Direction {
     Decrypt,
 }
 
+/// AES error
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Error {
+    /// Key manager failed to load or unload the key
     KeyManagerError,
 }
 
@@ -1030,9 +1040,12 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
     }
 }
 
+/// AES key manager trait
 pub trait AesKeyManager {
+    /// This function should implement loading the key (manually or from FUS)
     async fn load<T: Instance>(&mut self) -> Result<(), Error>;
 
+    /// This function should implement unloading the key if FUS key was used
     async fn unload<T: Instance>(&mut self) -> Result<(), Error>;
 }
 
