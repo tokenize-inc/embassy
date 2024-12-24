@@ -492,9 +492,9 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
         let mut last_block: [u8; 4 * CHUNK_SIZE] = [0; 4 * CHUNK_SIZE];
         let last_block_chunks = last_block.as_chunks_mut::<CHUNK_SIZE>().0;
         let aad_len_chunk = &mut last_block_chunks[1];
-        *aad_len_chunk = (8 * self.aad_len).to_be_bytes();
+        *aad_len_chunk = (8 * self.aad_len as u32).to_be_bytes();
         let payload_len_chunk = &mut last_block_chunks[3];
-        *payload_len_chunk = (8 * self.payload_len).to_be_bytes();
+        *payload_len_chunk = (8 * self.payload_len as u32).to_be_bytes();
 
         let mut full_tag: [u8; 16] = [0; 16];
         self.aes.write_and_read_bytes_blocking(&last_block, &mut full_tag);
