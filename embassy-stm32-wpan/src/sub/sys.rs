@@ -97,6 +97,17 @@ impl Sys {
             .await
     }
 
+    pub async fn shci_fus_load_user_key(&self, key_index: u8) -> Result<SchiCommandStatus, ()> {
+        let command: [u8; 1] = [key_index];
+        self.write_and_get_response(ShciOpcode::FusLoadUserKey, &command).await
+    }
+
+    pub async fn shci_fus_unload_user_key(&self, key_index: u8) -> Result<SchiCommandStatus, ()> {
+        let command: [u8; 1] = [key_index];
+        self.write_and_get_response(ShciOpcode::FusUnloadUserKey, &command)
+            .await
+    }
+
     /// `HW_IPCC_SYS_EvtNot`
     pub async fn read(&self) -> EvtBox<mm::MemoryManager> {
         Ipcc::receive(channels::cpu2::IPCC_SYSTEM_EVENT_CHANNEL, || unsafe {

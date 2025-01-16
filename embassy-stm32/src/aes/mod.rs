@@ -301,7 +301,7 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, const IV_SIZE: usize,
 
     fn reverse_bytes_in_words<const SIZE: usize>(block: &mut [u8; SIZE]) {
         assert_eq!(SIZE % 4, 0);
-        
+
         let words = block.array_chunks_mut::<4>();
         for word in words {
             word.reverse();
@@ -309,6 +309,304 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, const IV_SIZE: usize,
     }
 }
 
+/// AES-GCM Cipher Mode
+pub struct AesGcm<
+    'c,
+    'd,
+    const KEY_SIZE: usize,
+    const TAG_SIZE: usize,
+    T: Instance,
+    DmaIn: 'static,
+    DmaOut: 'static,
+    KP: AesKeyManager,
+> {
+    aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
+    key_manager: KP,
+    aad_len: usize,
+    payload_len: usize,
+    iv: [u8; 16],
+    dir: Direction,
+    aad_processed: bool,
+}
+
+impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, DmaOut, KM: AesKeyManager>
+    AesGcm<'c, 'd, KEY_SIZE, TAG_SIZE, T, DmaIn, DmaOut, KM>
+{
+    /// Constructs a new AES-GCM cipher for a cryptographic operation.
+    pub fn new(
+        aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
+        key_manager: KM,
+        nonce: &'c [u8; 12],
+        aad_len: usize,
+        payload_len: usize,
+        dir: Direction,
+    ) -> Self {
+        // Reset the peripheral to ensure it's in a clean state
+        rcc::enable_and_reset::<T>();
+        let mut iv = [0u8; 16];
+        Self::setup_iv(&mut iv, nonce);
+
+        return Self {
+            aes,
+            key_manager,
+            iv,
+            aad_len,
+            payload_len,
+            dir,
+            aad_processed: false,
+        };
+    }
+
+    fn setup_iv(iv: &mut [u8; 16], nonce: &'c [u8; 12]) {
+        iv[0..12].copy_from_slice(nonce);
+        iv[12..16].copy_from_slice(&0x2u32.to_be_bytes());
+    }
+
+    /// Starts AES GCM cipher operation.
+    ///
+    /// Operations done in scope of this are ordered exactly as described
+    /// in RM0434 Rev 13, p. 611
+    pub async fn start(&mut self) -> Result<(), Error>
+    where
+        DmaIn: crate::aes::DmaIn<T>,
+        DmaOut: crate::aes::DmaOut<T>,
+    {
+        self.aes.disable();
+        self.aes.set_gcm_chmod();
+        self.aes.set_byte_datatype();
+        self.aes.set_algorithm_phase(Gcmph::INITPHASE);
+        self.aes.setup_direction(self.dir);
+        self.key_manager.load::<T>().await?;
+        self.aes.setup_iv_register(&self.iv);
+        self.aes.enable();
+        self.aes.wait_until_computation_complete_blocking();
+        self.aes.clear_computation_complete_flag();
+
+        #[cfg(feature = "defmt")]
+        self.aes.log_aes_state();
+
+        Ok(())
+    }
+
+    /// Sets up authenticated associated data on the AES peripheral.
+    ///
+    /// Invariant: can be called only **once** per single decryption/encryption procedure
+    pub async fn aad(&mut self, aad: &[u8])
+    where
+        DmaIn: crate::aes::DmaIn<T>,
+        DmaOut: crate::aes::DmaOut<T>,
+    {
+        self.aad_processed = true;
+
+        let mut aad_buffer: [u8; 16] = [0; 16];
+        let mut aad_buffer_idx = 0;
+        self.aes.set_algorithm_phase(Gcmph::HEADERPHASE);
+
+        self.aes.enable();
+
+        let mut processed_aad_len = 0;
+
+        while processed_aad_len < aad.len() {
+            let remaining_aad_len = aad.len() - processed_aad_len;
+            let remaining_buffer_len = AES_BLOCK_SIZE - aad_buffer_idx;
+
+            // Fill buffer with as much data from aad as possible.
+            let len_to_copy = core::cmp::min(remaining_aad_len, remaining_buffer_len);
+            aad_buffer[aad_buffer_idx..aad_buffer_idx + len_to_copy]
+                .copy_from_slice(&aad[processed_aad_len..processed_aad_len + len_to_copy]);
+            aad_buffer_idx += len_to_copy;
+            processed_aad_len += len_to_copy;
+
+            // In case we didn't fill whole buffer ( i.e. whole aad has already been processed),
+            // fill the remaining space with 0s.
+            // this does nothing if `aad_buffer_idx == aad_buffer.len()`
+            aad_buffer[aad_buffer_idx..].fill(0);
+
+            self.aes.write_bytes_blocking(&mut aad_buffer);
+
+            // Reset the buffer idx for the next block processing
+            aad_buffer_idx = 0;
+        }
+    }
+
+    /// Performs encryption/decryption on provided payload.
+    ///
+    /// ## Contracts
+    /// - Output buffer must be at least as long as the input buffer.
+    /// - `aad` should be called beforehand, if `aad_len` has been set to nonzero value.
+    ///
+    /// **Panics** if either of them is not upheld.
+    pub async fn payload(&mut self, input: &[u8], output: &mut [u8])
+    where
+        DmaIn: crate::aes::DmaIn<T>,
+        DmaOut: crate::aes::DmaOut<T>,
+    {
+        if input.len() > output.len() {
+            panic!("Output buffer length must match input length.");
+        }
+        if !self.aad_processed && self.aad_len > 0 {
+            panic!("AES payload processing failed: AAD was supposed to be processed first")
+        }
+
+        self.aes.set_algorithm_phase(Gcmph::PAYLOADPHASE);
+
+        // This enable use is only meaningful when there's no AAD phase beforehand.
+        self.aes.enable();
+
+        let input_len_remainder = self.payload_len % AES_BLOCK_SIZE;
+
+        let mut idx: usize = 0;
+        let full_blocks_len = self.payload_len - input_len_remainder;
+        self.aes.write_and_read_bytes_blocking(
+            &input[idx..idx + full_blocks_len],
+            &mut output[idx..idx + full_blocks_len],
+        );
+
+        idx += full_blocks_len;
+
+        if input_len_remainder > 0 {
+            // Set up npblb so that AES knows to skip some trailing bytes
+            if self.dir == Direction::Encrypt {
+                let padding_len = AES_BLOCK_SIZE - input_len_remainder;
+                T::regs().cr().modify(|w| w.set_npblb(padding_len as u8));
+            }
+
+            let mut in_buffer: [u8; 16] = [0; 16];
+            let mut out_buffer = [0; 16];
+            // Copy remaining message to the front, the rest SHOULD be 0s
+            in_buffer[..input_len_remainder].copy_from_slice(&input[idx..idx + input_len_remainder]);
+            self.aes.write_and_read_bytes_blocking(&in_buffer, &mut out_buffer);
+            output[idx..idx + input_len_remainder].copy_from_slice(&out_buffer[..input_len_remainder]);
+        }
+    }
+
+    /// Generates an authentication tag for authenticated ciphers including GCM, CCM, and GMAC.
+    /// Called after the all data has been encrypted/decrypted by `payload`.
+    pub async fn finish(&mut self) -> Result<[u8; TAG_SIZE], Error> {
+        // We're falling back to polling data transfer,
+        // so CCF needs to be manually reset after DMA usage
+        self.aes.clear_computation_complete_flag();
+        self.aes.set_algorithm_phase(Gcmph::FINALPHASE);
+
+        const CHUNK_SIZE: usize = 4;
+        let mut last_block: [u8; 4 * CHUNK_SIZE] = [0; 4 * CHUNK_SIZE];
+        let last_block_chunks = last_block.as_chunks_mut::<CHUNK_SIZE>().0;
+        let aad_len_chunk = &mut last_block_chunks[1];
+        *aad_len_chunk = (8 * self.aad_len as u32).to_be_bytes();
+        let payload_len_chunk = &mut last_block_chunks[3];
+        *payload_len_chunk = (8 * self.payload_len as u32).to_be_bytes();
+
+        let mut full_tag: [u8; 16] = [0; 16];
+        self.aes.write_and_read_bytes_blocking(&last_block, &mut full_tag);
+
+        let mut tag: [u8; TAG_SIZE] = [0; TAG_SIZE];
+        tag.copy_from_slice(&full_tag[0..TAG_SIZE]);
+
+        self.aes.disable();
+
+        self.key_manager.unload::<T>().await?;
+
+        Ok(tag)
+    }
+}
+
+/// AES-CBC Cipher Mode
+pub struct AesCbc<'c, 'd, T: Instance, DmaIn: 'static, DmaOut: 'static, KM: AesKeyManager> {
+    aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
+    key_manager: KM,
+    payload_len: usize,
+    iv: [u8; 16],
+    dir: Direction,
+}
+
+impl<'c, 'd, T: Instance, DmaIn, DmaOut, KM: AesKeyManager> AesCbc<'c, 'd, T, DmaIn, DmaOut, KM> {
+    /// Constructs a new AES-CBC cipher for a cryptographic operation.
+    pub fn new(
+        aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
+        key_manager: KM,
+        payload_len: usize,
+        iv: [u8; 16],
+        dir: Direction,
+    ) -> Self {
+        // Reset the peripheral to ensure it's in a clean state
+        rcc::enable_and_reset::<T>();
+        // let mut iv = [0u8; 16];
+        // Self::setup_iv(&mut iv, nonce);
+
+        return Self {
+            aes,
+            key_manager,
+            iv,
+            payload_len,
+            dir,
+        };
+    }
+
+    /// Starts AES CBC cipher operation
+    ///
+    /// Operations done in scope of this are ordered exactly as described
+    /// in RM0434 Rev 13, p. 603
+    pub async fn start(&mut self) -> Result<(), Error> {
+        self.aes.disable();
+        self.aes.set_cbc_chmod();
+        self.aes.setup_direction(self.dir);
+        self.aes.setup_iv_register(&self.iv);
+        self.key_manager.load::<T>().await?;
+        self.aes.enable();
+
+        #[cfg(feature = "defmt")]
+        self.aes.log_aes_state();
+        Ok(())
+    }
+
+    /// Performs encryption/decryption on provided payload.
+    ///
+    /// ## Contracts
+    /// - Output buffer must be at least as long as the input buffer.
+    ///
+    /// **Panics** if either of them is not upheld.
+    pub async fn payload(&mut self, input: &[u8], output: &mut [u8])
+    where
+        DmaIn: crate::aes::DmaIn<T>,
+        DmaOut: crate::aes::DmaOut<T>,
+    {
+        if input.len() > output.len() {
+            panic!("Output buffer length must match input length.");
+        }
+
+        let input_len_remainder = self.payload_len % AES_BLOCK_SIZE;
+
+        let mut idx: usize = 0;
+        let full_blocks_len = self.payload_len - input_len_remainder;
+        self.aes.write_and_read_bytes_blocking(
+            &input[idx..idx + full_blocks_len],
+            &mut output[idx..idx + full_blocks_len],
+        );
+
+        idx += full_blocks_len;
+
+        if input_len_remainder > 0 {
+            // Set up npblb so that AES knows to skip some trailing bytes
+            if self.dir == Direction::Encrypt {
+                let padding_len = AES_BLOCK_SIZE - input_len_remainder;
+                T::regs().cr().modify(|w| w.set_npblb(padding_len as u8));
+            }
+
+            let mut in_buffer: [u8; 16] = [0; 16];
+            let mut out_buffer = [0; 16];
+            // Copy remaining message to the front, the rest SHOULD be 0s
+            in_buffer[..input_len_remainder].copy_from_slice(&input[idx..idx + input_len_remainder]);
+            self.aes.write_and_read_bytes_blocking(&in_buffer, &mut out_buffer);
+            output[idx..idx + input_len_remainder].copy_from_slice(&out_buffer[..input_len_remainder]);
+        }
+    }
+
+    /// Unloads the key
+    /// Called after the all data has been encrypted/decrypted by `payload`.
+    pub async fn finish(&mut self) -> Result<(), Error> {
+        self.key_manager.unload::<T>().await
+    }
+}
 /// This trait enables restriction of ciphers to specific key sizes.
 pub trait CipherSized {}
 
@@ -391,6 +689,13 @@ pub enum Direction {
     Decrypt,
 }
 
+/// AES error
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Error {
+    /// Key manager failed to load or unload the key
+    KeyManagerError,
+}
+
 /// AES Accelerator Driver
 pub struct Aes<'d, T, DmaIn = NoDma, DmaOut = NoDma> {
     _peripheral: PeripheralRef<'d, T>,
@@ -434,8 +739,18 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
         T::regs().cr().modify(|w| w.set_chmod2(true));
     }
 
+    fn set_gcm_chmod(&mut self) {
+        T::regs().cr().modify(|w| w.set_chmod10(11));
+        T::regs().cr().modify(|w| w.set_chmod2(false));
+    }
+
+    fn set_cbc_chmod(&mut self) {
+        T::regs().cr().modify(|w| w.set_chmod10(01));
+        T::regs().cr().modify(|w| w.set_chmod2(false));
+    }
+
     fn set_byte_datatype(&mut self) {
-        T::regs().cr().modify(|w| w.set_datatype(Datatype::BYTE));
+        T::regs().cr().modify(|w| w.set_datatype(Datatype::NONE));
     }
 
     /// Sets the phase of the algorithm that the processor is in.
@@ -470,24 +785,37 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
     /// - Order of words in provided array: most significant word first, least significant word last.
     /// - Order of bytes in word: most significant byte first, least significant byte last.
     fn setup_key_register<const N: usize>(&mut self, key: &[u8; N]) {
-        key // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15]
+        if N == 32 {
+            T::regs().cr().modify(|x| x.set_keysize(true));
+        } else if N == 16 {
+            T::regs().cr().modify(|x| x.set_keysize(false));
+        } else {
+            panic!("Incorrect AES key size")
+        }
+
+        key // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16]
             .array_chunks::<4>() // [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]
             .rev() // [[13, 14, 15, 16], [9, 10, 11, 12], [5, 6, 7, 8], [1, 2, 3, 4]]
             .enumerate() // [(0, [13, 14, 15, 16]),  (1, [9, 10, 11, 12]),  (2, [5, 6, 7, 8]),  (3, [1, 2, 3, 4])]
             .for_each(|(i, &word)| T::regs().keyr(i).modify(|w| w.set_key(u32::from_be_bytes(word))));
     }
 
-    /// Fills key register with provided IV.
+    /// Fills IV register with provided IV.
     /// ## Contracts
     /// - Order of words in provided array: most significant word first, least significant word last.
     /// - Order of bytes in word: most significant byte first, least significant byte last.
     fn setup_iv_register(&mut self, full_iv: &[u8; 16]) {
+        // let mut  full_iv = *full_iv;
+        // full_iv.reverse();
+
         //least significant word goes to IV register #0, most significant - IV register #3
-        full_iv // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15]
+        full_iv // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16]
             .array_chunks::<4>() // [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]
             .rev() // [[13, 14, 15, 16], [9, 10, 11, 12], [5, 6, 7, 8], [1, 2, 3, 4]]
             .enumerate() // [(0, [13, 14, 15, 16]),  (1, [9, 10, 11, 12]),  (2, [5, 6, 7, 8]),  (3, [1, 2, 3, 4])]
-            .for_each(|(i, &word)| T::regs().ivr(i).modify(|w| w.set_ivi(u32::from_be_bytes(word))));
+            .for_each(|(i, &word)| {
+                T::regs().ivr(i).modify(|w| w.set_ivi(u32::from_be_bytes(word)));
+            });
     }
 
     #[cfg(feature = "defmt")]
@@ -532,6 +860,7 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
             // read the computation result words into the output slice, one after another
             for word_out in block_out.array_chunks_mut::<BYTES_IN_WORD>() {
                 let read_word = T::regs().doutr().read().dout();
+
                 word_out.copy_from_slice(&read_word.to_be_bytes());
             }
 
@@ -586,7 +915,6 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
             self.clear_computation_complete_flag();
         }
     }
-
 
     /// Performs writing to DINR, and awaits without blocking,
     /// due to using AES CCF interrupts.
@@ -653,14 +981,12 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
         if blocks.len() == 0 {
             return;
         }
-        
+
         // Ensure input is a multiple of block size.
         assert_eq!(blocks.len() % AES_BLOCK_SIZE, 0);
         // Configure DMA to transfer input to crypto core.
         let dma_request = dma_in.request();
-        let dst_ptr =T::regs().dinr().as_ptr() as *mut u32;
-
-
+        let dst_ptr = T::regs().dinr().as_ptr() as *mut u32;
 
         let num_words = blocks.len() / 4;
         let src_ptr = core::ptr::slice_from_raw_parts(blocks.as_ptr().cast(), num_words);
@@ -711,6 +1037,57 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
         // Wait for the transfer to complete.
         dma_transfer.await;
         T::regs().cr().modify(|w| w.set_dmaouten(false));
+    }
+}
+
+/// AES key manager trait
+pub trait AesKeyManager {
+    /// This function should implement loading the key (manually or from FUS)
+    async fn load<T: Instance>(&mut self) -> Result<(), Error>;
+
+    /// This function should implement unloading the key if FUS key was used
+    async fn unload<T: Instance>(&mut self) -> Result<(), Error>;
+}
+
+impl AesKeyManager for &[u8; 16] {
+    /// Fills key register with provided key.
+    /// ## Contracts
+    /// - Order of words in provided array: most significant word first, least significant word last.
+    /// - Order of bytes in word: most significant byte first, least significant byte last.
+    async fn load<T: Instance>(&mut self) -> Result<(), Error> {
+        T::regs().cr().modify(|x| x.set_keysize(false));
+
+        self // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16]
+            .array_chunks::<4>() // [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]
+            .rev() // [[13, 14, 15, 16], [9, 10, 11, 12], [5, 6, 7, 8], [1, 2, 3, 4]]
+            .enumerate() // [(0, [13, 14, 15, 16]),  (1, [9, 10, 11, 12]),  (2, [5, 6, 7, 8]),  (3, [1, 2, 3, 4])]
+            .for_each(|(i, &word)| T::regs().keyr(i).modify(|w| w.set_key(u32::from_be_bytes(word))));
+        Ok(())
+    }
+
+    async fn unload<T: Instance>(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+impl AesKeyManager for &[u8; 32] {
+    /// Fills key register with provided key.
+    /// ## Contracts
+    /// - Order of words in provided array: most significant word first, least significant word last.
+    /// - Order of bytes in word: most significant byte first, least significant byte last.
+    async fn load<T: Instance>(&mut self) -> Result<(), Error> {
+        T::regs().cr().modify(|x| x.set_keysize(true));
+
+        self // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16]
+            .array_chunks::<4>() // [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]
+            .rev() // [[13, 14, 15, 16], [9, 10, 11, 12], [5, 6, 7, 8], [1, 2, 3, 4]]
+            .enumerate() // [(0, [13, 14, 15, 16]),  (1, [9, 10, 11, 12]),  (2, [5, 6, 7, 8]),  (3, [1, 2, 3, 4])]
+            .for_each(|(i, &word)| T::regs().keyr(i).modify(|w| w.set_key(u32::from_be_bytes(word))));
+        Ok(())
+    }
+
+    async fn unload<T: Instance>(&mut self) -> Result<(), Error> {
+        Ok(())
     }
 }
 
