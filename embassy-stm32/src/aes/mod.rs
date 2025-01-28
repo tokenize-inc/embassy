@@ -318,10 +318,10 @@ pub struct AesGcm<
     T: Instance,
     DmaIn: 'static,
     DmaOut: 'static,
-    KP: AesKeyManager,
+    KM: AesKeyManager<KEY_SIZE>,
 > {
     aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
-    key_manager: KP,
+    key_manager: KM,
     aad_len: usize,
     payload_len: usize,
     iv: [u8; 16],
@@ -329,7 +329,7 @@ pub struct AesGcm<
     aad_processed: bool,
 }
 
-impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, DmaOut, KM: AesKeyManager>
+impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, DmaOut, KM: AesKeyManager<KEY_SIZE>>
     AesGcm<'c, 'd, KEY_SIZE, TAG_SIZE, T, DmaIn, DmaOut, KM>
 {
     /// Constructs a new AES-GCM cipher for a cryptographic operation.
@@ -376,7 +376,7 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
         self.aes.set_byte_datatype();
         self.aes.set_algorithm_phase(Gcmph::INITPHASE);
         self.aes.setup_direction(self.dir);
-        self.key_manager.load::<T>().await?;
+        self.aes.load_key(&mut self.key_manager).await?;
         self.aes.setup_iv_register(&self.iv);
         self.aes.enable();
         self.aes.wait_until_computation_complete_blocking();
@@ -511,7 +511,15 @@ impl<'c, 'd, const KEY_SIZE: usize, const TAG_SIZE: usize, T: Instance, DmaIn, D
 }
 
 /// AES-CBC Cipher Mode
-pub struct AesCbc<'c, 'd, T: Instance, DmaIn: 'static, DmaOut: 'static, KM: AesKeyManager> {
+pub struct AesCbc<
+    'c,
+    'd,
+    T: Instance,
+    DmaIn: 'static,
+    DmaOut: 'static,
+    KM: AesKeyManager<KEY_SIZE>,
+    const KEY_SIZE: usize,
+> {
     aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
     key_manager: KM,
     payload_len: usize,
@@ -519,7 +527,9 @@ pub struct AesCbc<'c, 'd, T: Instance, DmaIn: 'static, DmaOut: 'static, KM: AesK
     dir: Direction,
 }
 
-impl<'c, 'd, T: Instance, DmaIn, DmaOut, KM: AesKeyManager> AesCbc<'c, 'd, T, DmaIn, DmaOut, KM> {
+impl<'c, 'd, T: Instance, DmaIn, DmaOut, KM: AesKeyManager<KEY_SIZE>, const KEY_SIZE: usize>
+    AesCbc<'c, 'd, T, DmaIn, DmaOut, KM, KEY_SIZE>
+{
     /// Constructs a new AES-CBC cipher for a cryptographic operation.
     pub fn new(
         aes: &'c mut Aes<'d, T, DmaIn, DmaOut>,
@@ -551,7 +561,7 @@ impl<'c, 'd, T: Instance, DmaIn, DmaOut, KM: AesKeyManager> AesCbc<'c, 'd, T, Dm
         self.aes.set_cbc_chmod();
         self.aes.setup_direction(self.dir);
         self.aes.setup_iv_register(&self.iv);
-        self.key_manager.load::<T>().await?;
+        self.aes.load_key(&mut self.key_manager).await?;
         self.aes.enable();
 
         #[cfg(feature = "defmt")]
@@ -753,6 +763,17 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
         T::regs().cr().modify(|w| w.set_datatype(Datatype::NONE));
     }
 
+    async fn load_key<const KEY_SIZE: usize, KM: AesKeyManager<KEY_SIZE>>(
+        &mut self,
+        key_manager: &mut KM,
+    ) -> Result<(), Error> {
+        if KEY_SIZE == 32 {
+            T::regs().cr().modify(|x| x.set_keysize(true));
+        } else {
+            T::regs().cr().modify(|x| x.set_keysize(false));
+        }
+        key_manager.load::<T>().await
+    }
     /// Sets the phase of the algorithm that the processor is in.
     /// Applicable for GCM and CCM encryption.
     fn set_algorithm_phase(&mut self, phase: pac::aes::vals::Gcmph) {
@@ -1041,7 +1062,7 @@ impl<'d, T: Instance, DmaIn, DmaOut> Aes<'d, T, DmaIn, DmaOut> {
 }
 
 /// AES key manager trait
-pub trait AesKeyManager {
+pub trait AesKeyManager<const KEY_SIZE: usize> {
     /// This function should implement loading the key (manually or from FUS)
     async fn load<T: Instance>(&mut self) -> Result<(), Error>;
 
@@ -1049,14 +1070,12 @@ pub trait AesKeyManager {
     async fn unload<T: Instance>(&mut self) -> Result<(), Error>;
 }
 
-impl AesKeyManager for &[u8; 16] {
+impl AesKeyManager<16> for &[u8; 16] {
     /// Fills key register with provided key.
     /// ## Contracts
     /// - Order of words in provided array: most significant word first, least significant word last.
     /// - Order of bytes in word: most significant byte first, least significant byte last.
     async fn load<T: Instance>(&mut self) -> Result<(), Error> {
-        T::regs().cr().modify(|x| x.set_keysize(false));
-
         self // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16]
             .array_chunks::<4>() // [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]
             .rev() // [[13, 14, 15, 16], [9, 10, 11, 12], [5, 6, 7, 8], [1, 2, 3, 4]]
@@ -1070,14 +1089,12 @@ impl AesKeyManager for &[u8; 16] {
     }
 }
 
-impl AesKeyManager for &[u8; 32] {
+impl AesKeyManager<32> for &[u8; 32] {
     /// Fills key register with provided key.
     /// ## Contracts
     /// - Order of words in provided array: most significant word first, least significant word last.
     /// - Order of bytes in word: most significant byte first, least significant byte last.
     async fn load<T: Instance>(&mut self) -> Result<(), Error> {
-        T::regs().cr().modify(|x| x.set_keysize(true));
-
         self // visualisation: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16]
             .array_chunks::<4>() // [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]
             .rev() // [[13, 14, 15, 16], [9, 10, 11, 12], [5, 6, 7, 8], [1, 2, 3, 4]]
