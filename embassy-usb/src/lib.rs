@@ -461,14 +461,16 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
             }
             Event::Resume => {
                 trace!("usb: resume");
-                self.suspended = false;
+                // Token-TODO SW-608: Resume Sequence not able to be detected.
+                //self.suspended = false;
                 for h in &mut self.handlers {
                     h.suspended(false);
                 }
             }
             Event::Suspend => {
                 trace!("usb: suspend");
-                self.suspended = true;
+                // Token-TODO SW-608: Resume Sequence not able to be detected.
+                //self.suspended = true;
                 for h in &mut self.handlers {
                     h.suspended(true);
                 }
