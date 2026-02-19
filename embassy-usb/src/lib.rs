@@ -517,6 +517,7 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                     OutResponse::Accepted
                 }
                 (Request::SET_ADDRESS, addr @ 1..=127) => {
+                    debug!("SET_ADDRESS: {}", addr);
                     self.address = addr as u8;
                     self.set_address_pending = true;
                     self.device_state = UsbDeviceState::Addressed;
@@ -618,9 +619,11 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
     }
 
     fn handle_control_in<'a>(&'a mut self, req: Request, buf: &'a mut [u8]) -> InResponse<'a> {
+        debug!("control_in req: {:?}", req);
         match (req.request_type, req.recipient) {
             (RequestType::Standard, Recipient::Device) => match req.request {
                 Request::GET_STATUS => {
+                    debug!("GET_STATUS");
                     let mut status: u16 = 0x0000;
                     if self.self_powered {
                         status |= 0x0001;
@@ -631,7 +634,10 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                     buf[..2].copy_from_slice(&status.to_le_bytes());
                     InResponse::Accepted(&buf[..2])
                 }
-                Request::GET_DESCRIPTOR => self.handle_get_descriptor(req, buf),
+                Request::GET_DESCRIPTOR => {
+                    debug!("GET_DESCRIPTOR");
+                    self.handle_get_descriptor(req, buf)
+                }
                 Request::GET_CONFIGURATION => {
                     let status = match self.device_state {
                         UsbDeviceState::Configured => CONFIGURATION_VALUE,

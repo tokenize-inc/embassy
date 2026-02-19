@@ -195,11 +195,18 @@ impl<'d, D: Driver<'d>> Builder<'d, D> {
         self.bos_descriptor.end_bos();
 
         // Log the number of allocator bytes actually used in descriptor buffers
-        info!("USB: config_descriptor used: {}", self.config_descriptor.position());
-        info!("USB: bos_descriptor used: {}", self.bos_descriptor.writer.position());
-        info!("USB: msos_descriptor used: {}", msos_descriptor.len());
-        info!("USB: control_buf size: {}", self.control_buf.len());
+        #[cfg(feature = "defmt")]
+        error!("USB: config_descriptor used: {}", self.config_descriptor.position());
+        #[cfg(feature = "defmt")]
+        error!("USB: bos_descriptor used: {}", self.bos_descriptor.writer.position());
+        #[cfg(feature = "defmt")]
+        error!("USB: msos_descriptor used: {}", msos_descriptor.len());
+        #[cfg(feature = "defmt")]
+        error!("USB: control_buf size: {}", self.control_buf.len());
+        #[cfg(feature = "defmt")]
+        error!("USB Interfaces: {}", self.interfaces.len());
 
+        error!("Config Descriptor: {=[u8]:x}", self.config_descriptor.buf);
         UsbDevice::build(
             self.driver,
             self.config,

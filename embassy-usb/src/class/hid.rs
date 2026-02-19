@@ -1,5 +1,6 @@
 //! USB HID (Human Interface Device) class implementation.
 
+use core::error;
 use core::mem::MaybeUninit;
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -497,6 +498,8 @@ impl<'d> Handler for Control<'d> {
         if req.index != self.if_num.0 as u16 {
             return None;
         }
+
+        error!("HID control_in request: {:?}", req);
 
         match (req.request_type, req.recipient) {
             (RequestType::Standard, Recipient::Interface) => match req.request {
