@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
+use embassy_sync::channel::{Receiver, Sender};
 use heapless::Vec;
 
 use crate::control::{InResponse, OutResponse, Recipient, Request, RequestType};
@@ -306,8 +306,7 @@ pub struct CcidReaderWriter<'d, D: Driver<'d>, const READ_N: usize, const WRITE_
 
     protocol_data: ProtocolData,
 
-    ccid_to_app: &'d Channel<CriticalSectionRawMutex, RawPacket, WRITE_N>,
-    app_to_ccid: &'d Channel<CriticalSectionRawMutex, RawPacket, READ_N>,
+    ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, RawPacket, WRITE_N>,
 
     slot_status: u8,
 
@@ -457,9 +456,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         builder: &mut Builder<'d, D>,
         state: &'d mut State,
         config: Config<'d>,
-        card_issuers_data: Option<&[u8]>,
-        ccid_to_app: &'d Channel<CriticalSectionRawMutex, RawPacket, WRITE_N>,
-        app_to_ccid: &'d Channel<CriticalSectionRawMutex, RawPacket, READ_N>,
+        ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, RawPacket, WRITE_N>,
     ) -> Self {
         let (ep_out, ep_in, ep_int_in, offset) = build(builder, state, config);
 
@@ -483,7 +480,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             bulk_abort: None,
             control_abort: None,
             ccid_to_app,
-            app_to_ccid,
             protocol_data: ProtocolData::default(),
         }
     }
@@ -558,7 +554,10 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
     }
 
     /// Main loop of the CCID reader/writer, which continuously reads from the host and handles packets, while also listening for packets from the application to send to the host.
-    pub async fn run(mut self) -> ! {
+    pub async fn run(
+        mut self,
+        app_to_ccid: &'static mut Receiver<'static, CriticalSectionRawMutex, RawPacket, READ_N>,
+    ) -> ! {
         let mut buf = [0u8; READ_N];
 
         self.ready().await;
@@ -568,12 +567,22 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         }
 
         loop {
-            match select(self.app_to_ccid.receive(), self.read(&mut buf)).await {
+            match select(app_to_ccid.receive(), self.read(&mut buf)).await {
                 Either::First(raw_packet) => {
                     trace!(
                         "CCID: Received packet from application to send to host: {=[u8]:x}",
                         &raw_packet
                     );
+                    // Wrap in a PRDR_to_PC_DataBlock response and send to host
+                    let data = self.rdr_to_pc_data_block(&raw_packet, Chain::BeginsAndEnds).await;
+
+                    trace!("CCID: Sending response packet to host: {=[u8]:x}", &data);
+
+                    if let Err(e) = self.write(&data).await {
+                        warn!("CCID: Failed to write response packet: {:?}", e);
+                    }
+
+                    self.state = CcidReaderState::Idle;
                 }
                 Either::Second(Ok(response_type)) => match response_type {
                     ResponseType::Internal(packet) => {
@@ -591,6 +600,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                             &packet
                         );
                         self.ccid_to_app.send(packet).await;
+                        trace!("CCID: Sent packet to application");
                     }
                     ResponseType::None => {
                         trace!("CCID: Nothing to handle")
