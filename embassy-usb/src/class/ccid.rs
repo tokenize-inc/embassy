@@ -1,12 +1,13 @@
 //! USB CCID (Chip Card Interface Device) class implementation.
-
+extern crate alloc;
+use alloc::boxed::Box;
 use core::convert::{TryFrom, TryInto};
 use core::mem::MaybeUninit;
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use embassy_futures::select::{select, Either};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::raw::{self, CriticalSectionRawMutex};
 use embassy_sync::channel::{Receiver, Sender};
 use heapless::Vec;
 
@@ -36,6 +37,9 @@ const CCID_CMD_FAIL: u8 = 1 << 6;
 /// raw packet
 pub type RawPacket = heapless::Vec<u8, PACKET_SIZE>;
 
+/// Application-level packet, which may be larger than a single USB packet and may require chaining.
+pub type ApplicationPacket = Box<[u8]>;
+
 /// extended packet for commands that exceed the size of a single USB packet, e.g. APDUs with chaining
 pub type ExtPacket = heapless::Vec<u8, MAX_MSG_LENGTH>;
 
@@ -55,9 +59,9 @@ enum PipeError {
 /// CCID Response type
 pub enum ResponseType {
     /// Send to the usb endpoint directly
-    Internal(RawPacket),
+    Internal(ExtPacket),
     /// Send to the application to handle
-    External(RawPacket),
+    External(ExtPacket),
     /// No response needed, e.g. for ABORT commands
     None,
 }
@@ -170,8 +174,8 @@ pub const CCID_DESC_NUM_CLOCK_SUPPORTED: u8 = 0x00;
 pub const CCID_DESC_DATA_RATE_BPS: [u8; 4] = [0x80, 0x25, 0x00, 0x00];
 /// bNumDataRatesSupported
 pub const CCID_DESC_NUM_DATA_RATES_SUPPORTED: u8 = 0x00;
-/// 254 (as per ICCD spec)
-pub const CCID_DESC_MAX_IFSD: [u8; 4] = [0xfe, 0x00, 0x00, 0x00];
+/// 254
+pub const CCID_DESC_MAX_IFSD: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
 /// dwSyncProtocols: none
 pub const CCID_DESC_SYNC_PROTOCOLS: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
 /// dwMechanical: no special characteristics
@@ -306,7 +310,7 @@ pub struct CcidReaderWriter<'d, D: Driver<'d>, const READ_N: usize, const WRITE_
 
     protocol_data: ProtocolData,
 
-    ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, RawPacket, WRITE_N>,
+    ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, ApplicationPacket, WRITE_N>,
 
     slot_status: u8,
 
@@ -314,7 +318,7 @@ pub struct CcidReaderWriter<'d, D: Driver<'d>, const READ_N: usize, const WRITE_
     slot: u8,
     state: CcidReaderState,
     sent: usize,
-    outbox: Option<RawPacket>,
+    outbox: Option<ApplicationPacket>,
     ext_packet: ExtPacket,
     #[allow(dead_code)]
     packet_len: usize,
@@ -456,7 +460,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         builder: &mut Builder<'d, D>,
         state: &'d mut State,
         config: Config<'d>,
-        ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, RawPacket, WRITE_N>,
+        ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, ApplicationPacket, WRITE_N>,
     ) -> Self {
         let (ep_out, ep_in, ep_int_in, offset) = build(builder, state, config);
 
@@ -476,7 +480,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             long_packet_missing: 0,
             in_chain: 0,
             started_processing: false,
-            atr: Self::construct_minimal_atr(), //Self::construct_atr(card_issuers_data, false),
+            atr: Self::construct_t1_atr(),
             bulk_abort: None,
             control_abort: None,
             ccid_to_app,
@@ -484,30 +488,72 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         }
     }
 
-    /// Constructs a minimal ATR with historical bytes "Token", indicating that this is a generic CCID device with no special features, and that the host should use the default communication parameters when communicating with the card. This is used in the initial SlotStatus response to indicate the presence of a card, and in response to the GetParameters command.
-    fn construct_minimal_atr() -> Vec<u8, 32> {
+    /// Constrcts T1 ATR
+    fn construct_t1_atr() -> Vec<u8, 32> {
+        /*
+        TS: Initial Character (0x3B = direct, 0x3F = inverse convention)
+        T0: Format Character: high nibble = Y1 = bitfield indicating which of TA1, TB1, TC1, TD1 are present, low nibble = K = number of historical bytes
+        Interface bytes (TA1, TB1, TC1, TD1): optional, presence indicated by Y1 in T0, Each TDn’s lower nibble selects a protocol (e.g., 0x01 means T=1) and upper nibble shows which next interface bytes follow.
+        Historical Bytes: Vendor info, ATR text, etc.
+        TCK: Check character, present if any protocol other than T=0 is used. T=1 requires TCK
+
+        TS=0x3B (direct convention)
+        T0=
+        TA1=None
+        TB1=0x00 (VPP is not electrically connected)
+        TC1=0x00 (no extra guard time)
+        TD1=0x81 (TD2 included, T=1 protocol)
+        TA2=None
+        TB2=None
+        TC2=None
+        TD2=0x31 (TD3 included, T=1 protocol)
+        TA3=0xFE (Information Field Size Integer IFSI 254)
+        TB3=0x15 (Block Waiting Integer: 1 - Character Waiting Integer: 5)
+        TC3=None
+        Historycal bytes="Token"
+        TCK=
+        */
         let historical_bytes = b"Token"; // 5 bytes
-        let k = historical_bytes.len() as u8;
+        let k = historical_bytes.len() as u8 + 1; // +1 for 0x59
 
         let mut atr: Vec<u8, 32> = Vec::new();
 
         // TS: direct convention
         atr.push(0x3B).ok();
 
-        // T0: high nibble = Y1 = 1 → TA1 present only, low nibble = K = historical bytes length
-        let y1 = 0b0001 << 4; // TA1 present
-        let t0 = y1 | k;
+        // T0:
+        // Y1 = TB1 | TC1 | TD1 present = 0xE0
+        // K = number of historical bytes
+        let t0 = 0xE0 | k;
         atr.push(t0).ok();
 
-        // TA1
-        atr.push(0x11).ok(); // Di=1, Fi=5
+        // ---- Interface bytes group 1 ----
+        atr.push(0x00).ok(); // TB1 (VPP not connected)
+        atr.push(0x00).ok(); // TC1 (no extra guard time)
+        atr.push(0x81).ok(); // TD1 (T=1, TD2 follows)
 
-        // No TB1, TC1, TD1 → nothing else here
+        // ---- Interface bytes group 2 ----
+        atr.push(0x31).ok(); // TD2 (T=1, TA3 and TB3 follow)
+
+        // ---- Interface bytes group 3 ----
+        atr.push(0xFE).ok(); // TA3 (IFSC = 254)
+        atr.push(0x15).ok(); // TB3 (BWI=1, CWI=5)
+
+        // ---- Add in 0x59 category byte ----
+        atr.push(0x59).ok();
 
         // Historical bytes
         atr.extend_from_slice(historical_bytes).ok();
 
-        // No TCK for T=0
+        // ---- TCK ----
+        // XOR of everything from T0 through last historical byte
+        let mut tck: u8 = 0;
+        for byte in atr.iter().skip(1) {
+            tck ^= *byte;
+        }
+        atr.push(tck).ok();
+
+        trace!("CCID: Constructed ATR: {=[u8]:x}", &atr);
 
         atr
     }
@@ -556,7 +602,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
     /// Main loop of the CCID reader/writer, which continuously reads from the host and handles packets, while also listening for packets from the application to send to the host.
     pub async fn run(
         mut self,
-        app_to_ccid: &'static mut Receiver<'static, CriticalSectionRawMutex, RawPacket, READ_N>,
+        app_to_ccid: &'static mut Receiver<'static, CriticalSectionRawMutex, ApplicationPacket, READ_N>,
     ) -> ! {
         let mut buf = [0u8; READ_N];
 
@@ -573,16 +619,35 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         "CCID: Received packet from application to send to host: {=[u8]:x}",
                         &raw_packet
                     );
-                    // Wrap in a PRDR_to_PC_DataBlock response and send to host
-                    let data = self.rdr_to_pc_data_block(&raw_packet, Chain::BeginsAndEnds).await;
 
-                    trace!("CCID: Sending response packet to host: {=[u8]:x}", &data);
+                    // If packet is larger than the max usb size we need to split in into chunks and send with correct chaining
+                    if raw_packet.len() > PACKET_SIZE - CCID_HEADER_LEN {
+                        trace!("CCID: Packet larger than max USB packet size, splitting into chunks with chaining");
 
-                    if let Err(e) = self.write(&data).await {
-                        warn!("CCID: Failed to write response packet: {:?}", e);
+                        let max_chunk = PACKET_SIZE - CCID_HEADER_LEN;
+                        let chunk = raw_packet[..max_chunk].to_vec();
+
+                        let data = self.rdr_to_pc_data_block(&chunk, Chain::Begins).await;
+                        trace!("CCID: Sending Chained response packet to host: {=[u8]:x}", &data);
+
+                        if let Err(e) = self.write(&data).await {
+                            warn!("CCID: Failed to write Chained response packet: {:?}", e);
+                        }
+
+                        self.state = CcidReaderState::Sending;
+                        self.sent = chunk.len();
+                        self.outbox = Some(raw_packet);
+                    } else {
+                        trace!("CCID: Packet fits in single USB packet, sending with beginsAndEnds");
+                        // Wrap in a PRDR_to_PC_DataBlock response and send to host
+                        let data = self.rdr_to_pc_data_block(&raw_packet, Chain::BeginsAndEnds).await;
+                        trace!("CCID: Sending response packet to host: {=[u8]:x}", &data);
+
+                        if let Err(e) = self.write(&data).await {
+                            warn!("CCID: Failed to write response packet: {:?}", e);
+                        }
+                        self.state = CcidReaderState::Idle;
                     }
-
-                    self.state = CcidReaderState::Idle;
                 }
                 Either::Second(Ok(response_type)) => match response_type {
                     ResponseType::Internal(packet) => {
@@ -590,6 +655,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                             "CCID: Received packet from host to send back to host: {=[u8]:x}",
                             &packet
                         );
+
                         if let Err(e) = self.write(&packet).await {
                             warn!("CCID: Failed to write response packet: {:?}", e);
                         }
@@ -599,7 +665,9 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                             "CCID: Received packet from host to send to application: {=[u8]:x}",
                             &packet
                         );
-                        self.ccid_to_app.send(packet).await;
+                        self.ccid_to_app
+                            .send(packet.as_slice().to_vec().into_boxed_slice())
+                            .await;
                         trace!("CCID: Sent packet to application");
                     }
                     ResponseType::None => {
@@ -627,7 +695,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             if packet.len() < CCID_HEADER_LEN {
                 error!("CCID: unexpected short packet");
                 self.reset_state();
-                return Err(ReadError::BufferOverflow);
+                return Ok(ResponseType::None);
             }
             self.ext_packet.clear();
             self.ext_packet
@@ -646,7 +714,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     self.long_packet_missing,
                     self.in_chain
                 );
-                return Err(ReadError::BufferOverflow);
+                return Ok(ResponseType::None);
             }
         } else {
             if self.ext_packet.extend_from_slice(&packet).is_err() {
@@ -656,7 +724,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     self.ext_packet.len() + packet.len(),
                 );
                 self.reset_state();
-                return Err(ReadError::BufferOverflow);
+                return Ok(ResponseType::None);
             }
             self.in_chain += 1;
             if packet.len() > self.long_packet_missing {
@@ -666,7 +734,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 self.long_packet_missing -= packet.len();
             }
             if self.long_packet_missing != 0 {
-                return Err(ReadError::BufferOverflow);
+                return Ok(ResponseType::None);
             }
 
             trace!(
@@ -696,7 +764,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                             "CCID: Received command while waiting for bulk abort with seq {}, rejecting",
                             control_abort
                         );
-                        let mut packet = RawPacket::zeroed_until(CCID_HEADER_LEN);
+                        let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
                         packet[0] = 0x6c;
                         packet[6] = self.seq;
                         packet[7] = CCID_CMD_FAIL;
@@ -817,7 +885,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             Err(PacketError::ShortPacket) => {
                 error!("CCID: Unexpectedly short packet");
                 self.reset_state();
-                let mut packet = RawPacket::zeroed_until(CCID_HEADER_LEN);
+                let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
                 packet[0] = 0x6c;
                 packet[6] = self.seq;
                 packet[7] = CCID_CMD_FAIL;
@@ -827,7 +895,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             Err(PacketError::UnknownCommand(_p)) => {
                 info!("CCID: Unknown command {:?}", &_p);
                 self.seq = self.ext_packet[6];
-                let mut packet = RawPacket::zeroed_until(CCID_HEADER_LEN);
+                let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
                 packet[0] = 0x6c;
                 packet[6] = self.seq;
                 packet[7] = CCID_CMD_FAIL;
@@ -856,7 +924,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
 
     // This method performs an abort and should only be called if we received matching ABORT
     // requests both from the control pipe and from the bulk endpoint.
-    fn abort(&mut self) -> RawPacket {
+    fn abort(&mut self) -> ExtPacket {
         trace!("CCID: Aborting");
         // reset state
         self.bulk_abort = None;
@@ -868,51 +936,51 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         self.long_packet_missing = 0;
 
         // send response for successful abort
-        let mut packet = RawPacket::zeroed_until(CCID_HEADER_LEN);
+        let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
         packet[0] = 0x81;
         packet[6] = self.seq;
         packet
     }
 
-    async fn prime_outbox(&mut self, data: RawPacket) {
-        if self.state != CcidReaderState::ReadyToSend && self.state != CcidReaderState::Sending {
-            return;
-        }
+    // async fn prime_outbox(&mut self, data: RawPacket) {
+    //     if self.state != CcidReaderState::ReadyToSend && self.state != CcidReaderState::Sending {
+    //         return;
+    //     }
 
-        if self.outbox.is_some() {
-            error!("Full outbox");
-            self.reset_state();
-            return;
-        }
+    //     if self.outbox.is_some() {
+    //         error!("Full outbox");
+    //         self.reset_state();
+    //         return;
+    //     }
 
-        let chunk_size = core::cmp::min(PACKET_SIZE - CCID_HEADER_LEN, data.len() - self.sent);
-        let chunk = &data[self.sent..][..chunk_size];
-        self.sent += chunk_size;
-        let more = self.sent < data.len();
+    //     let chunk_size = core::cmp::min(PACKET_SIZE - CCID_HEADER_LEN, data.len() - self.sent);
+    //     let chunk = &data[self.sent..][..chunk_size];
+    //     self.sent += chunk_size;
+    //     let more = self.sent < data.len();
 
-        let chain = match (self.state, more) {
-            (CcidReaderState::ReadyToSend, true) => {
-                self.state = CcidReaderState::Sending;
-                Chain::Begins
-            }
-            (CcidReaderState::ReadyToSend, false) => {
-                self.state = CcidReaderState::Idle;
-                Chain::BeginsAndEnds
-            }
-            (CcidReaderState::Sending, true) => Chain::Continues,
-            (CcidReaderState::Sending, false) => {
-                self.state = CcidReaderState::Idle;
-                Chain::Ends
-            }
-            // logically impossible
-            _ => {
-                return;
-            }
-        };
+    //     let chain = match (self.state, more) {
+    //         (CcidReaderState::ReadyToSend, true) => {
+    //             self.state = CcidReaderState::Sending;
+    //             Chain::Begins
+    //         }
+    //         (CcidReaderState::ReadyToSend, false) => {
+    //             self.state = CcidReaderState::Idle;
+    //             Chain::BeginsAndEnds
+    //         }
+    //         (CcidReaderState::Sending, true) => Chain::Continues,
+    //         (CcidReaderState::Sending, false) => {
+    //             self.state = CcidReaderState::Idle;
+    //             Chain::Ends
+    //         }
+    //         // logically impossible
+    //         _ => {
+    //             return;
+    //         }
+    //     };
 
-        let primed_packet = DataBlock::new(self.seq, chain, chunk);
-        self.outbox = Some(primed_packet.into());
-    }
+    //     let primed_packet = DataBlock::new(self.seq, chain, chunk);
+    //     self.outbox = Some(primed_packet.into());
+    // }
 
     async fn handle_xfer(&mut self, command: XfrBlock) -> Result<ResponseType, ReadError> {
         trace!(
@@ -928,20 +996,22 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     self.state = CcidReaderState::Processing;
 
                     Ok(ResponseType::External(
-                        RawPacket::from_slice(command.data()).map_err(|_| ReadError::BufferOverflow)?,
+                        ExtPacket::from_slice(command.data()).map_err(|_| ReadError::BufferOverflow)?,
                     ))
                 }
                 Ok(Chain::Begins) => {
                     trace!("CCID: Received XfrBlock with chaining, waiting for more packets");
 
                     // If the outbox is None, we create a new RawPacket with the data from the command. If it's Some, we append the data from the command to the existing outbox packet.
-                    if let Some(outbox) = &mut self.outbox {
-                        outbox
-                            .extend_from_slice(command.data())
-                            .map_err(|_| ReadError::BufferOverflow)?;
+                    if let Some(outbox) = self.outbox.take() {
+                        let mut temp = outbox.to_vec();
+                        temp.extend_from_slice(command.data());
+                        let temp_boxed = temp.into_boxed_slice();
+                        self.outbox = Some(temp_boxed);
                     } else {
-                        self.outbox =
-                            Some(RawPacket::from_slice(command.data()).map_err(|_| ReadError::BufferOverflow)?);
+                        let data = RawPacket::from_slice(command.data()).map_err(|_| ReadError::BufferOverflow)?;
+
+                        self.outbox = Some(data.as_slice().to_vec().into_boxed_slice());
                     }
 
                     self.state = CcidReaderState::Receiving;
@@ -964,11 +1034,11 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 Ok(Chain::Continues) => {
                     trace!("CCID: Received XfrBlock with chaining, waiting for more packets");
 
-                    if let Some(outbox) = &mut self.outbox {
-                        // TODO Tyler, check if we filled too much
-                        outbox
-                            .extend_from_slice(command.data())
-                            .map_err(|_| ReadError::BufferOverflow)?;
+                    if let Some(outbox) = self.outbox.take() {
+                        let mut temp = outbox.to_vec();
+                        temp.extend_from_slice(command.data());
+                        let temp_boxed = temp.into_boxed_slice();
+                        self.outbox = Some(temp_boxed);
                     } else {
                         error!("Received chained packet but outbox is None");
                         self.reset_state();
@@ -982,18 +1052,18 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 Ok(Chain::Ends) => {
                     trace!("CCID: Received last XfrBlock in chain, processing full message");
 
-                    if let Some(outbox) = &mut self.outbox {
-                        // TODO Tyler, check if we filled too much, reset_state in case of overflow
-                        outbox
-                            .extend_from_slice(command.data())
-                            .map_err(|_| ReadError::BufferOverflow)?;
+                    if let Some(outbox) = self.outbox.take() {
+                        let mut temp = outbox.to_vec();
+                        temp.extend_from_slice(command.data());
+                        let temp_boxed = temp.into_boxed_slice();
+                        self.outbox = Some(temp_boxed);
 
                         let full_message = outbox.clone();
                         self.outbox = None;
                         self.state = CcidReaderState::Processing;
 
                         Ok(ResponseType::External(
-                            RawPacket::from_slice(&full_message).map_err(|_| ReadError::BufferOverflow)?,
+                            ExtPacket::from_slice(&full_message).map_err(|_| ReadError::BufferOverflow)?,
                         ))
                     } else {
                         error!("Received chained packet but outbox is None");
@@ -1019,8 +1089,36 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             }
             CcidReaderState::Sending => match command.chain() {
                 Ok(Chain::ExpectingMore) => {
-                    trace!("CCID: Received XfrBlock while sending, expecting more packets");
-                    Ok(ResponseType::None)
+                    trace!(
+                        "CCID: Received XfrBlock while sending, expecting more packets: Sent {} bytes so far",
+                        self.sent
+                    );
+                    // get next block f outbox and prime it for sending
+                    if let Some(outbox) = &self.outbox {
+                        trace!(
+                            "CCID: Outbox has {} bytes, sent {}, remaining {}",
+                            outbox.len(),
+                            self.sent,
+                            outbox.len() - self.sent
+                        );
+                        let chunk_size = core::cmp::min(PACKET_SIZE - CCID_HEADER_LEN, outbox.len() - self.sent);
+                        let chunk = &outbox[self.sent..][..chunk_size];
+                        self.sent += chunk_size;
+                        let has_more = self.sent < outbox.len();
+                        let chain = if has_more { Chain::Continues } else { Chain::Ends };
+                        let data = self.rdr_to_pc_data_block(&chunk.to_vec(), chain).await;
+                        trace!("CCID: Sending chained response packet to host: {=[u8]:x}", &data);
+                        if chain == Chain::Ends {
+                            self.reset_state();
+                        }
+                        Ok(ResponseType::Internal(
+                            ExtPacket::from_slice(&data).map_err(|_| ReadError::BufferOverflow)?,
+                        ))
+                    } else {
+                        error!("Received chained packet but outbox is None");
+                        self.reset_state();
+                        Ok(ResponseType::None)
+                    }
                 }
                 _chain => {
                     error!("unexpectedly in receiving state and got chain");
@@ -1032,11 +1130,11 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
     }
 
     /// builds the RDR_to_PC_NotifySlotChange interrupt endpoint message
-    async fn rdr_to_pc_notify_slot_change(&mut self, init: bool) -> RawPacket {
+    async fn rdr_to_pc_notify_slot_change(&mut self, init: bool) -> ExtPacket {
         // Per CCID spec, 2 bits per slot: LSB = present, MSB = changed
         // Hardcode: slot 0 present+changed, slot 1 present+changed, rest 0
         // Bits: 0=slot0 present, 1=slot0 changed, 2=slot1 present, 3=slot1 changed
-        let mut packet = RawPacket::zeroed_until(2); // Only need 2 bytes for up to 4 slots
+        let mut packet = ExtPacket::zeroed_until(2); // Only need 2 bytes for up to 4 slots
         packet[0] = 0x50; // bMessageType
         if init {
             match self.slot {
@@ -1057,8 +1155,8 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
     }
 
     /// builds a DataRateAndClockFrequency response with the given status and error codes.
-    async fn rdr_to_pc_data_rate_and_clock_frequency(&mut self, status_code: u8, error_code: u8) -> RawPacket {
-        let mut packet = RawPacket::zeroed_until(17);
+    async fn rdr_to_pc_data_rate_and_clock_frequency(&mut self, status_code: u8, error_code: u8) -> ExtPacket {
+        let mut packet = ExtPacket::zeroed_until(17);
         // bMessageType
         packet[0] = 0x84;
         // dwLength of data = 8 bytes
@@ -1079,8 +1177,8 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
     }
 
     /// builds an Escape response with the given status and error codes, and the first 4 bytes of data.
-    async fn rdr_to_pc_escape(&mut self, status_code: u8, error_code: u8, data: &[u8; 4]) -> RawPacket {
-        let mut packet = RawPacket::zeroed_until(17);
+    async fn rdr_to_pc_escape(&mut self, status_code: u8, error_code: u8, data: &[u8; 4]) -> ExtPacket {
+        let mut packet = ExtPacket::zeroed_until(17);
         // bMessageType
         packet[0] = 0x83;
         // dwLength
@@ -1101,14 +1199,14 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
     }
 
     /// builds a DataBlock response with the given data and chain status.
-    async fn rdr_to_pc_data_block(&mut self, data: &[u8], chain: Chain) -> RawPacket {
+    async fn rdr_to_pc_data_block(&mut self, data: &[u8], chain: Chain) -> ExtPacket {
         let packet = DataBlock::new(self.seq, chain, &data);
         packet.into()
     }
 
     /// builds a SlotStatus response with the given status and error codes.
-    async fn rdr_to_pc_slot_status(&mut self, status_code: u8, error_code: u8) -> RawPacket {
-        let mut packet = RawPacket::zeroed_until(CCID_HEADER_LEN);
+    async fn rdr_to_pc_slot_status(&mut self, status_code: u8, error_code: u8) -> ExtPacket {
+        let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
         // bMessageType
         packet[0] = 0x81;
         // dwLength
@@ -1127,8 +1225,8 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
     }
 
     /// builds a Parameters response with the current protocol parameters.
-    async fn rdr_to_pc_parameters(&mut self, status_code: u8, error_code: u8) -> RawPacket {
-        let mut packet = RawPacket::zeroed_until(17);
+    async fn rdr_to_pc_parameters(&mut self, status_code: u8, error_code: u8) -> ExtPacket {
+        let mut packet = ExtPacket::zeroed_until(17);
         // bMessageType
         packet[0] = 0x82;
         // dwLength of data = 7 bytes
@@ -1258,12 +1356,13 @@ impl<'d, D: Driver<'d>, const N: usize> CcidBulkIn<'d, D, N> {
         assert!(report.len() <= N);
 
         let max_packet_size = usize::from(self.ep_in.info().max_packet_size);
-        let zlp_needed = report.len() < N && (report.len() % max_packet_size == 0);
+        trace!("CCID: Endpoint max packet size: {}", max_packet_size);
+        let zlp_needed = report.len() == max_packet_size;
         for chunk in report.chunks(max_packet_size) {
             trace!("CCID: Writing chunk to host: {=[u8]:x}, {}", chunk, chunk.len());
             self.ep_in.write(chunk).await?;
         }
-
+        trace!("CCID: Finished writing report to host");
         if zlp_needed {
             trace!("CCID: Writing ZLP to host");
             self.ep_in.write(&[]).await?;
@@ -1555,6 +1654,26 @@ impl RawPacketExt for RawPacket {
     }
 }
 
+impl RawPacketExt for ExtPacket {
+    fn data_len(&self) -> usize {
+        u32::from_le_bytes(self[1..5].try_into().unwrap()) as usize
+    }
+
+    fn zeroed() -> Self {
+        let mut res = Self::new();
+        let cap = res.capacity();
+        res.resize_default(cap).unwrap();
+        res
+    }
+
+    fn zeroed_until(len: usize) -> Self {
+        let mut res = Self::new();
+        let cap = res.capacity();
+        res.resize_default(len.min(cap)).unwrap();
+        res
+    }
+}
+
 /// Errors that can occur when parsing a packet.
 pub enum PacketError {
     /// The packet is too short to contain a valid header.
@@ -1624,7 +1743,7 @@ pub struct DataBlock<'a> {
 impl<'a> DataBlock<'a> {
     /// Creates a new DataBlock with the given sequence number, chaining status, and data. The length of the data must be less than or equal to `MAX_MSG_LENGTH - CCID_HEADER_LEN` to ensure that it can fit in a single packet without overflowing our buffers.
     pub fn new(seq: u8, chain: Chain, data: &'a [u8]) -> Self {
-        assert!(data.len() + CCID_HEADER_LEN <= PACKET_SIZE);
+        //assert!(data.len() + CCID_HEADER_LEN <= PACKET_SIZE);
         Self { seq, chain, data }
     }
 }
@@ -1656,6 +1775,31 @@ impl From<DataBlock<'_>> for RawPacket {
     fn from(block: DataBlock<'_>) -> RawPacket {
         let len = block.data.len();
         let mut packet = RawPacket::zeroed_until(CCID_HEADER_LEN + len);
+        packet[0] = 0x80;
+        packet[1..][..4].copy_from_slice(
+            &u32::try_from(len)
+                .expect("Packets should not be more than 4GiB")
+                .to_le_bytes(),
+        );
+        packet[5] = 0;
+        packet[6] = block.seq;
+
+        // status
+        packet[7] = 0;
+        // error
+        packet[8] = 0;
+        // chain parameter
+        packet[9] = block.chain as u8;
+        packet[CCID_HEADER_LEN..][..len].copy_from_slice(block.data);
+
+        packet
+    }
+}
+
+impl From<DataBlock<'_>> for ExtPacket {
+    fn from(block: DataBlock<'_>) -> ExtPacket {
+        let len = block.data.len();
+        let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN + len);
         packet[0] = 0x80;
         packet[1..][..4].copy_from_slice(
             &u32::try_from(len)

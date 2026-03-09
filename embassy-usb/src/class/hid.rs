@@ -1,6 +1,5 @@
 //! USB HID (Human Interface Device) class implementation.
 
-use core::error;
 use core::mem::MaybeUninit;
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
