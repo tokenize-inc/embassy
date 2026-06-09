@@ -4,7 +4,7 @@ use crate::cmd::CmdPacket;
 use crate::consts::TlPacketType;
 use crate::evt::{CcEvt, EvtBox, EvtPacket};
 #[allow(unused_imports)]
-use crate::shci::{SchiCommandStatus, ShciBleInitCmdParam, ShciOpcode};
+use crate::shci::{SchiCommandStatus, ShciBleInitCmdParam, ShciConfigParam, ShciOpcode};
 use crate::sub::mm;
 use crate::tables::{SysTable, WirelessFwInfoTable};
 use crate::unsafe_linked_list::LinkedListNode;
@@ -91,6 +91,20 @@ impl Sys {
         self.write_and_get_response(ShciOpcode::BleInit, param.payload()).await
     }
 
+    /// `SHCI_C2_Config` (opcode `0x75`).
+    ///
+    /// Configures CPU2 system-level options. Most notably, when `ble_nvm_ram_address`
+    /// (and/or `thread_nvm_ram_address`) in `param` is non-zero, CPU2 stores its BLE
+    /// (resp. Thread) persistent data in that user-provided SRAM2 buffer instead of its
+    /// internal NVM, and raises the NVM-update events selected in `param.event_mask`.
+    ///
+    /// When SRAM2-backed storage is enabled, CPU1 must hold the corresponding hardware
+    /// semaphore (Sem8 for BLE, Sem9 for Thread) while reading the buffer to obtain a
+    /// consistent snapshot, then release it.
+    pub async fn shci_c2_config(&self, param: ShciConfigParam) -> Result<SchiCommandStatus, ()> {
+        self.write_and_get_response(ShciOpcode::Config, param.payload()).await
+    }
+
     pub async fn shci_c2_flash_erase_activity(&self, erase_active: bool) -> Result<SchiCommandStatus, ()> {
         let command: [u8; 1] = [erase_active as u8];
         self.write_and_get_response(ShciOpcode::FlashEraseActivity, &command)
@@ -110,6 +124,19 @@ impl Sys {
 
     /// `HW_IPCC_SYS_EvtNot`
     pub async fn read(&self) -> EvtBox<mm::MemoryManager> {
+        Self::recv_event().await
+    }
+
+    /// Receive one system event WITHOUT holding the `Sys` mutex.
+    ///
+    /// The async system-event path (CPU2→CPU1, IPCC channel 2 RX, `SYSTEM_EVT_QUEUE`)
+    /// is disjoint from the command/response path (CPU1→CPU2, channel 2 TX,
+    /// `SYS_CMD_BUF`), so reading events does not need to be serialized with command
+    /// senders. Exposing this as an associated function lets a long-running event
+    /// pump await events without parking on the shared mutex — which would otherwise
+    /// deadlock any task that takes the mutex via `block_on` (e.g. the flash-erase
+    /// path's `set_flash_erase_activity`).
+    pub async fn recv_event() -> EvtBox<mm::MemoryManager> {
         Ipcc::receive(channels::cpu2::IPCC_SYSTEM_EVENT_CHANNEL, || unsafe {
             if let Some(node_ptr) = LinkedListNode::remove_head(SYSTEM_EVT_QUEUE.as_mut_ptr()) {
                 Some(EvtBox::new(node_ptr.cast()))

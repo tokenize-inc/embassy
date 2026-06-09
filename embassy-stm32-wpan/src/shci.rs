@@ -91,6 +91,11 @@ pub enum ShciOpcode {
     Mac802_15_4DeInit = opcode(SHCI_OGF, 0x78),
 }
 
+/// `Config1` bit0: store BLE persistent (NVM) data in the user-provided SRAM2
+/// buffer (`ble_nvm_ram_address`) instead of CPU2's internal flash. Must be set
+/// for the SRAM2-backed NVM flow; leaving it clear keeps `BLE_NVM_DATA_TO_INTERNAL_FLASH`.
+pub const SHCI_C2_CONFIG_CONFIG1_BIT0_BLE_NVM_DATA_TO_SRAM: u8 = 1 << 0;
+
 pub const SHCI_C2_CONFIG_EVTMASK1_BIT0_ERROR_NOTIF_ENABLE: u8 = 1 << 0;
 pub const SHCI_C2_CONFIG_EVTMASK1_BIT1_BLE_NVM_RAM_UPDATE_ENABLE: u8 = 1 << 1;
 pub const SHCI_C2_CONFIG_EVTMASK1_BIT2_THREAD_NVM_RAM_UPDATE_ENABLE: u8 = 1 << 2;
