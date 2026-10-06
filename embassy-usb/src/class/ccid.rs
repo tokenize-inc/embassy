@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use core::convert::{TryFrom, TryInto};
 use core::mem::MaybeUninit;
 use core::ops::Range;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::AtomicUsize;
 
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::{self, CriticalSectionRawMutex};
@@ -354,7 +354,6 @@ pub enum ReportId {
 pub struct State {
     control: MaybeUninit<Control>,
     in_transfer_offset: AtomicUsize,
-    out_transfer_offset: AtomicUsize,
 }
 
 impl<'d> Default for State {
@@ -369,7 +368,6 @@ impl State {
         State {
             control: MaybeUninit::uninit(),
             in_transfer_offset: AtomicUsize::new(0),
-            out_transfer_offset: AtomicUsize::new(0),
         }
     }
 }
@@ -440,7 +438,7 @@ fn build<'d, D: Driver<'d>>(
     builder: &mut Builder<'d, D>,
     state: &'d mut State,
     config: Config<'d>,
-) -> (D::EndpointOut, D::EndpointIn, D::EndpointIn, &'d AtomicUsize) {
+) -> (D::EndpointOut, D::EndpointIn, D::EndpointIn) {
     let mut func = builder.function(USB_CLASS_CCID, USB_SUBCLASS_NONE, USB_PROTOCOL_NONE);
     let mut iface = func.interface();
     let if_num = iface.interface_number();
@@ -472,7 +470,7 @@ fn build<'d, D: Driver<'d>>(
 
     builder.handler(control);
 
-    (ep_out, ep_in, ep_int_in, &state.out_transfer_offset)
+    (ep_out, ep_in, ep_int_in)
 }
 
 impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWriter<'d, D, READ_N, WRITE_N> {
@@ -487,10 +485,10 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         config: Config<'d>,
         ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, ApplicationPacket, WRITE_N>,
     ) -> Self {
-        let (ep_out, ep_in, ep_int_in, offset) = build(builder, state, config);
+        let (ep_out, ep_in, ep_int_in) = build(builder, state, config);
 
         Self {
-            bulk_out: CcidBulkOut { ep_out, offset },
+            bulk_out: CcidBulkOut { ep_out },
             bulk_in: CcidBulkIn { ep_in },
             int_in: CcidIntIn { ep_int_in },
             slot_status: 0x00, // An ICC is present and active
@@ -728,11 +726,23 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 .extend_from_slice(&packet)
                 .expect("Raw packets are not larger than ext packets");
 
+            // Compare the bytes actually received against the header's dwLength; the first
+            // packet may be shorter than PACKET_SIZE (e.g. a smaller endpoint max packet size).
             let pl = packet.data_len();
-            if pl > PACKET_SIZE - CCID_HEADER_LEN {
+            let message_len = CCID_HEADER_LEN.saturating_add(pl);
+            if message_len > self.ext_packet.capacity() {
+                error!(
+                    "CCID: Message length {} exceeds the maximum of {}",
+                    message_len,
+                    self.ext_packet.capacity()
+                );
+                self.reset_state();
+                return Ok(ResponseType::None);
+            }
+            if packet.len() < message_len {
                 self.receiving_long = true;
                 self.in_chain = 1;
-                self.long_packet_missing = pl - (PACKET_SIZE - CCID_HEADER_LEN);
+                self.long_packet_missing = message_len - packet.len();
                 self.packet_len = pl;
                 trace!(
                     "CCID: Received first packet of long message, pl {}, missing {}, in_chain {}",
@@ -1310,7 +1320,6 @@ pub enum CcidReaderState {
 /// Bulk Out endpoint for receiving CCID commands from the host.
 pub struct CcidBulkOut<'d, D: Driver<'d>> {
     ep_out: D::EndpointOut,
-    offset: &'d AtomicUsize,
 }
 
 /// USB CCID interrupt endpoint.
@@ -1404,70 +1413,39 @@ impl<'d, D: Driver<'d>> CcidBulkOut<'d, D> {
         self.ep_out.wait_enabled().await;
     }
 
-    /// Reads an output report from the Interrupt Out pipe.
+    /// Reads a single USB packet from the Bulk OUT pipe into `buf`.
     ///
-    /// Reads until a short packet is received or `buf` is full.
-    ///
-    /// **Note:** If `buf` is larger than the maximum packet size of the endpoint (i.e. output
-    /// reports may be split across multiple packets) and this method's future
-    /// is dropped after some packets have been read, the next call to `read()`
-    /// will return a [`ReadError::Sync`]. The range in the sync error
-    /// indicates the portion `buf` that was filled by the current call to
-    /// `read()`. If the dropped future used the same `buf`, then `buf` will
-    /// contain the full report.
+    /// CCID messages longer than one packet are reassembled by the caller (see
+    /// [`CcidReaderWriter::handle_packet`]). Reading one packet at a time keeps this
+    /// future cancel-safe: dropping it never loses data already taken from the endpoint.
+    /// Zero-length packets are skipped. `buf` must hold at least one max-size packet.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
-        assert!(!buf.is_empty());
-        let limit = buf.len();
-
-        // Read packets from the endpoint
         let max_packet_size = usize::from(self.ep_out.info().max_packet_size);
-        let starting_offset = self.offset.load(Ordering::Acquire);
-        let mut total = starting_offset;
+        assert!(buf.len() >= max_packet_size);
 
         loop {
-            for chunk in buf[starting_offset..limit].chunks_mut(max_packet_size) {
-                match self.ep_out.read(chunk).await {
-                    Ok(size) => {
-                        trace!("CCID Read chunk of size {} from host", size);
-                        trace!("CCID Read chunk: {=[u8]:x}", &chunk[..size]);
-
-                        total += size;
-                        if size < max_packet_size || total == limit {
-                            self.offset.store(0, Ordering::Release);
-                            break;
+            match self.ep_out.read(&mut buf[..max_packet_size]).await {
+                Ok(0) => continue,
+                Ok(size) => {
+                    trace!("CCID Read packet of size {} from host", size);
+                    trace!("CCID Read packet: {=[u8]:x}", &buf[..size]);
+                    return Ok(size);
+                }
+                Err(err) => {
+                    let read_error: ReadError = err.into();
+                    match read_error {
+                        ReadError::BufferOverflow => {
+                            error!("Host sent a packet larger than the endpoint max packet size ({})", max_packet_size);
                         }
-                        self.offset.store(total, Ordering::Release);
-                    }
-                    Err(err) => {
-                        self.offset.store(0, Ordering::Release);
-                        let read_error: ReadError = err.into();
-                        match read_error {
-                            ReadError::BufferOverflow => {
-                                error!(
-                                    "Host sent output report larger than the read buffer ({})",
-                                    limit
-                                );
-                            }
-                            ReadError::Disabled => {
-                                warn!("Endpoint was disabled while reading");
-                                self.ready().await;
-                            }
-                            ReadError::Sync(_) => unreachable!(),
+                        ReadError::Disabled => {
+                            warn!("Endpoint was disabled while reading");
+                            self.ready().await;
                         }
-                        return Err(read_error);
+                        ReadError::Sync(_) => unreachable!(),
                     }
+                    return Err(read_error);
                 }
             }
-
-            if total > 0 {
-                break;
-            }
-        }
-
-        if starting_offset > 0 {
-            Err(ReadError::Sync(starting_offset..total))
-        } else {
-            Ok(total)
         }
     }
 }
