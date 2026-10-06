@@ -56,6 +56,8 @@ enum PipeError {
     CmdSlotBusy = 0xE0,
     // Offset of the offending field in the command: dwLength.
     BadLength = 0x01,
+    // Offset of the offending field in the command: bSlot (slot does not exist).
+    BadSlot = 0x05,
     CommandNotSupported = 0x00,
 }
 
@@ -1050,6 +1052,17 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 packet[8] = PipeError::CommandNotSupported as u8;
                 Ok(ResponseType::Internal(packet))
             }
+            Err(PacketError::WrongSlot(slot)) => {
+                warn!("CCID: Command for nonexistent slot {}", slot);
+                let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
+                packet[0] = 0x81; // bMessageType: RDR_to_PC_SlotStatus
+                packet[5] = slot;
+                packet[6] = self.ext_packet[6];
+                // bmCommandStatus = failed, bmICCStatus = no ICC present
+                packet[7] = CCID_CMD_FAIL | 0x02;
+                packet[8] = PipeError::BadSlot as u8;
+                Ok(ResponseType::Internal(packet))
+            }
         }
     }
 
@@ -1792,6 +1805,8 @@ pub enum PacketError {
     ShortPacket,
     /// The packet contains an unknown command in the header.
     UnknownCommand(u8),
+    /// The packet addresses a slot above bMaxSlotIndex.
+    WrongSlot(u8),
 }
 
 /// A trait for parsing a CCID packet from a raw byte slice. This is implemented for the different command types (e.g. XfrBlock) and provides methods for accessing the header fields and data.
@@ -1799,8 +1814,7 @@ pub trait Packet: core::ops::Deref<Target = ExtPacket> {
     #[inline]
     /// Returns the slot number from the packet header. As per CCID spec, this is in byte 5 of the header. This implementation assumes only one slot (slot 0) and asserts that the slot number is 0.
     fn slot(&self) -> u8 {
-        // we have only one slot
-        assert!(self[5] == 0);
+        // Command::try_from rejects slots above bMaxSlotIndex, so this is always a valid slot.
         self[5]
     }
 
@@ -2046,8 +2060,8 @@ macro_rules! command_message {
                 if packet.len() < CCID_HEADER_LEN {
                     return Err(PacketError::ShortPacket);
                 }
-                if packet[5] != 0 {
-                    // wrong slot
+                if packet[5] > CCID_DESC_MAX_SLOT_INDEX {
+                    return Err(PacketError::WrongSlot(packet[5]));
                 }
                 let command_byte = packet[0];
                 Ok(match command_byte {
