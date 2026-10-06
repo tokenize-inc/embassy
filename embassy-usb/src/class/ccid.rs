@@ -206,6 +206,98 @@ pub const CCID_DESC_PIN_SUPPORT: u8 = 0;
 /// bMaxCCIDBusySlots
 pub const CCID_DESC_MAX_BUSY_SLOTS: u8 = 1;
 
+/// Default CCID class-specific descriptor, including bLength and bDescriptorType.
+pub const DEFAULT_CCID_DESCRIPTOR: [u8; CCID_DESC_BLENGTH as usize] = [
+    // bLength
+    CCID_DESC_BLENGTH,
+    // bDescriptorType
+    CCID_DESC_DESCTYPE_CCID,
+    // bcdCCID
+    CCID_DESC_SPEC_1_10[0],
+    CCID_DESC_SPEC_1_10[1],
+    // bMaxSlotIndex
+    CCID_DESC_MAX_SLOT_INDEX,
+    // bVoltageSupport
+    CCID_DESC_VOLTAGE_5V,
+    // dwProtocols: APDU level, T=1 only (0 = T=0, 3 = T0+T1)
+    CCID_DESC_PROTOCOL_T1[0],
+    CCID_DESC_PROTOCOL_T1[1],
+    CCID_DESC_PROTOCOL_T1[2],
+    CCID_DESC_PROTOCOL_T1[3],
+    // dwDefaultClock (3.58 MHz)
+    CCID_DESC_CLOCK_FREQUENCY_KHZ[0],
+    CCID_DESC_CLOCK_FREQUENCY_KHZ[1],
+    CCID_DESC_CLOCK_FREQUENCY_KHZ[2],
+    CCID_DESC_CLOCK_FREQUENCY_KHZ[3],
+    // dwMaximumClock (same)
+    CCID_DESC_CLOCK_FREQUENCY_KHZ[0],
+    CCID_DESC_CLOCK_FREQUENCY_KHZ[1],
+    CCID_DESC_CLOCK_FREQUENCY_KHZ[2],
+    CCID_DESC_CLOCK_FREQUENCY_KHZ[3],
+    // bNumClockSupported
+    CCID_DESC_NUM_CLOCK_SUPPORTED,
+    // dwDataRate (9600 bps)
+    CCID_DESC_DATA_RATE_BPS[0],
+    CCID_DESC_DATA_RATE_BPS[1],
+    CCID_DESC_DATA_RATE_BPS[2],
+    CCID_DESC_DATA_RATE_BPS[3],
+    // dwMaxDataRate (same)
+    CCID_DESC_DATA_RATE_BPS[0],
+    CCID_DESC_DATA_RATE_BPS[1],
+    CCID_DESC_DATA_RATE_BPS[2],
+    CCID_DESC_DATA_RATE_BPS[3],
+    // bNumDataRatesSupported
+    CCID_DESC_NUM_DATA_RATES_SUPPORTED,
+    // dwMaxIFSD (254)
+    CCID_DESC_MAX_IFSD[0],
+    CCID_DESC_MAX_IFSD[1],
+    CCID_DESC_MAX_IFSD[2],
+    CCID_DESC_MAX_IFSD[3],
+    // dwSyncProtocols: none
+    CCID_DESC_SYNC_PROTOCOLS[0],
+    CCID_DESC_SYNC_PROTOCOLS[1],
+    CCID_DESC_SYNC_PROTOCOLS[2],
+    CCID_DESC_SYNC_PROTOCOLS[3],
+    // dwMechanical: no special characteristics
+    CCID_DESC_MECHANICAL[0],
+    CCID_DESC_MECHANICAL[1],
+    CCID_DESC_MECHANICAL[2],
+    CCID_DESC_MECHANICAL[3],
+    // dwFeatures, see following comments
+    // Auto configuration based on ATR
+    // Auto activation on insert
+    // Auto voltage selection
+    // Auto clock change
+    // Auto baud rate change
+    // Auto parameter negotiation made by CCID
+    // Short and extended APDU level exchange
+    // 0xFE, 0x00, 0x04, 0x00,
+    // ICCD: lower word (=0840): only requests valid for USB-ICC
+    // upper word: 0000 = char level, 0002 = short APDU, 0004 = short+exteded APDU
+    CCID_DESC_FEATURES[0],
+    CCID_DESC_FEATURES[1],
+    CCID_DESC_FEATURES[2],
+    CCID_DESC_FEATURES[3],
+    // dwMaxCCIDMsgLen (3072)
+    // gnuk: 271
+    CCID_DESC_MAX_MSG_LENGTH_LE[0],
+    CCID_DESC_MAX_MSG_LENGTH_LE[1],
+    CCID_DESC_MAX_MSG_LENGTH_LE[2],
+    CCID_DESC_MAX_MSG_LENGTH_LE[3],
+    // bClassGetResponse ("echo"), as per ICCD spec
+    CCID_DESC_CLASS_GET_RESPONSE,
+    // bClassEnvelope ("echo"), as per ICCD spec, gnuk: 0
+    CCID_DESC_CLASS_ENVELOPE,
+    // wlcdLayout (none)
+    CCID_DESC_LCD_LAYOUT[0],
+    CCID_DESC_LCD_LAYOUT[1],
+    // bPinSupport
+    // ICCD: "No PIN pad, not relevant, fixed for legacy reasons"
+    CCID_DESC_PIN_SUPPORT,
+    // bMaxCCIDBusySlots
+    CCID_DESC_MAX_BUSY_SLOTS,
+];
+
 /// Default value for bmFindexDindex, meaning that the CCID does not support any automatic features based on the ATR, and that the host should use the default values for the other protocol parameters.
 pub const DEFAULT_FIDI: u8 = 0x11;
 /// Default value for bmTCCKST0, meaning that the CCID does not support any of the T=0 specific features.
@@ -223,7 +315,9 @@ pub const DEFAULT_NAD: u8 = 0x00;
 
 /// Configuration for the CCID reader/writer.
 pub struct Config<'d> {
-    /// CCID class-specific descriptor.
+    /// Complete CCID class-specific descriptor (54 bytes, including bLength and
+    /// bDescriptorType). It is used both in the configuration descriptor and for
+    /// GET_DESCRIPTOR requests. An empty slice selects [`DEFAULT_CCID_DESCRIPTOR`].
     pub ccid_descriptor: &'d [u8],
 
     /// Max packet size for the bulk IN endpoint.
@@ -343,96 +437,18 @@ fn build<'d, D: Driver<'d>>(
     let if_num = iface.interface_number();
     let mut alt = iface.alt_setting(USB_CLASS_CCID, USB_SUBCLASS_NONE, USB_PROTOCOL_NONE, None);
 
-    alt.descriptor(
-        CCID_DESC_DESCTYPE_CCID,
-        &[
-            // bcdCCID
-            CCID_DESC_SPEC_1_10[0],
-            CCID_DESC_SPEC_1_10[1],
-            // bMaxSlotIndex
-            CCID_DESC_MAX_SLOT_INDEX,
-            // bVoltageSupport
-            CCID_DESC_VOLTAGE_5V,
-            // dwProtocols: APDU level, T=1 only (0 = T=0, 3 = T0+T1)
-            CCID_DESC_PROTOCOL_T1[0],
-            CCID_DESC_PROTOCOL_T1[1],
-            CCID_DESC_PROTOCOL_T1[2],
-            CCID_DESC_PROTOCOL_T1[3],
-            // dwDefaultClock (3.58 MHz)
-            CCID_DESC_CLOCK_FREQUENCY_KHZ[0],
-            CCID_DESC_CLOCK_FREQUENCY_KHZ[1],
-            CCID_DESC_CLOCK_FREQUENCY_KHZ[2],
-            CCID_DESC_CLOCK_FREQUENCY_KHZ[3],
-            // dwMaximumClock (same)
-            CCID_DESC_CLOCK_FREQUENCY_KHZ[0],
-            CCID_DESC_CLOCK_FREQUENCY_KHZ[1],
-            CCID_DESC_CLOCK_FREQUENCY_KHZ[2],
-            CCID_DESC_CLOCK_FREQUENCY_KHZ[3],
-            // bNumClockSupported
-            CCID_DESC_NUM_CLOCK_SUPPORTED,
-            // dwDataRate (9600 bps)
-            CCID_DESC_DATA_RATE_BPS[0],
-            CCID_DESC_DATA_RATE_BPS[1],
-            CCID_DESC_DATA_RATE_BPS[2],
-            CCID_DESC_DATA_RATE_BPS[3],
-            // dwMaxDataRate (same)
-            CCID_DESC_DATA_RATE_BPS[0],
-            CCID_DESC_DATA_RATE_BPS[1],
-            CCID_DESC_DATA_RATE_BPS[2],
-            CCID_DESC_DATA_RATE_BPS[3],
-            // bNumDataRatesSupported
-            CCID_DESC_NUM_DATA_RATES_SUPPORTED,
-            // dwMaxIFSD
-            // dwMaxIFSD (254)
-            CCID_DESC_MAX_IFSD[0],
-            CCID_DESC_MAX_IFSD[1],
-            CCID_DESC_MAX_IFSD[2],
-            CCID_DESC_MAX_IFSD[3],
-            // dwSyncProtocols: none
-            CCID_DESC_SYNC_PROTOCOLS[0],
-            CCID_DESC_SYNC_PROTOCOLS[1],
-            CCID_DESC_SYNC_PROTOCOLS[2],
-            CCID_DESC_SYNC_PROTOCOLS[3],
-            // dwMechanical: no special characteristics
-            CCID_DESC_MECHANICAL[0],
-            CCID_DESC_MECHANICAL[1],
-            CCID_DESC_MECHANICAL[2],
-            CCID_DESC_MECHANICAL[3],
-            // dwFeatures, see following comments
-            // Auto configuration based on ATR
-            // Auto activation on insert
-            // Auto voltage selection
-            // Auto clock change
-            // Auto baud rate change
-            // Auto parameter negotiation made by CCID
-            // Short and extended APDU level exchange
-            // 0xFE, 0x00, 0x04, 0x00,
-            // ICCD: lower word (=0840): only requests valid for USB-ICC
-            // upper word: 0000 = char level, 0002 = short APDU, 0004 = short+exteded APDU
-            CCID_DESC_FEATURES[0],
-            CCID_DESC_FEATURES[1],
-            CCID_DESC_FEATURES[2],
-            CCID_DESC_FEATURES[3],
-            // dwMaxCCIDMsgLen (3072)
-            // gnuk: 271
-            CCID_DESC_MAX_MSG_LENGTH_LE[0],
-            CCID_DESC_MAX_MSG_LENGTH_LE[1],
-            CCID_DESC_MAX_MSG_LENGTH_LE[2],
-            CCID_DESC_MAX_MSG_LENGTH_LE[3],
-            // bClassGetResponse ("echo"), as per ICCD spec
-            CCID_DESC_CLASS_GET_RESPONSE,
-            // bClassEnvelope ("echo"), as per ICCD spec, gnuk: 0
-            CCID_DESC_CLASS_ENVELOPE,
-            // wlcdLayout (none)
-            CCID_DESC_LCD_LAYOUT[0],
-            CCID_DESC_LCD_LAYOUT[1],
-            // bPinSupport
-            // ICCD: "No PIN pad, not relevant, fixed for legacy reasons"
-            CCID_DESC_PIN_SUPPORT,
-            // bMaxCCIDBusySlots
-            CCID_DESC_MAX_BUSY_SLOTS,
-        ],
+    let ccid_descriptor: [u8; CCID_DESC_BLENGTH as usize] = if config.ccid_descriptor.is_empty() {
+        DEFAULT_CCID_DESCRIPTOR
+    } else {
+        config.ccid_descriptor.try_into().expect("CCID descriptor must be exactly 54 bytes")
+    };
+    assert!(
+        ccid_descriptor[0] == CCID_DESC_BLENGTH && ccid_descriptor[1] == CCID_DESC_DESCTYPE_CCID,
+        "CCID descriptor must start with bLength 0x36 and bDescriptorType 0x21"
     );
+
+    // The builder writes bLength and bDescriptorType itself.
+    alt.descriptor(CCID_DESC_DESCTYPE_CCID, &ccid_descriptor[2..]);
 
     // CCID -> HOST
     let ep_in = alt.endpoint_bulk_in(config.max_packet_size_in);
@@ -443,7 +459,7 @@ fn build<'d, D: Driver<'d>>(
 
     drop(func);
 
-    let control = state.control.write(Control::new(if_num));
+    let control = state.control.write(Control::new(if_num, ccid_descriptor));
 
     builder.handler(control);
 
@@ -1451,101 +1467,11 @@ pub struct Control {
 }
 
 impl Control {
-    /// Creates a new Control handler.
-    pub fn new(if_num: InterfaceNumber) -> Self {
+    /// Creates a new Control handler that reports `ccid_descriptor` for GET_DESCRIPTOR requests.
+    pub fn new(if_num: InterfaceNumber, ccid_descriptor: [u8; CCID_DESC_BLENGTH as usize]) -> Self {
         Control {
             if_num,
-            ccid_descriptor: [
-                // bLength
-                CCID_DESC_BLENGTH,
-                // bDescriptorType
-                CCID_DESC_DESCTYPE_CCID,
-                // bcdCCID
-                CCID_DESC_SPEC_1_10[0],
-                CCID_DESC_SPEC_1_10[1],
-                // bMaxSlotIndex
-                CCID_DESC_MAX_SLOT_INDEX,
-                // bVoltageSupport
-                CCID_DESC_VOLTAGE_5V,
-                // dwProtocols: APDU level, T=1 only (0 = T=0, 3 = T0+T1)
-                CCID_DESC_PROTOCOL_T1[0],
-                CCID_DESC_PROTOCOL_T1[1],
-                CCID_DESC_PROTOCOL_T1[2],
-                CCID_DESC_PROTOCOL_T1[3],
-                // dwDefaultClock (3.58 MHz)
-                CCID_DESC_CLOCK_FREQUENCY_KHZ[0],
-                CCID_DESC_CLOCK_FREQUENCY_KHZ[1],
-                CCID_DESC_CLOCK_FREQUENCY_KHZ[2],
-                CCID_DESC_CLOCK_FREQUENCY_KHZ[3],
-                // dwMaximumClock (same)
-                CCID_DESC_CLOCK_FREQUENCY_KHZ[0],
-                CCID_DESC_CLOCK_FREQUENCY_KHZ[1],
-                CCID_DESC_CLOCK_FREQUENCY_KHZ[2],
-                CCID_DESC_CLOCK_FREQUENCY_KHZ[3],
-                // bNumClockSupported
-                CCID_DESC_NUM_CLOCK_SUPPORTED,
-                // dwDataRate (9600 bps)
-                CCID_DESC_DATA_RATE_BPS[0],
-                CCID_DESC_DATA_RATE_BPS[1],
-                CCID_DESC_DATA_RATE_BPS[2],
-                CCID_DESC_DATA_RATE_BPS[3],
-                // dwMaxDataRate (same)
-                CCID_DESC_DATA_RATE_BPS[0],
-                CCID_DESC_DATA_RATE_BPS[1],
-                CCID_DESC_DATA_RATE_BPS[2],
-                CCID_DESC_DATA_RATE_BPS[3],
-                // bNumDataRatesSupported
-                CCID_DESC_NUM_DATA_RATES_SUPPORTED,
-                // dwMaxIFSD
-                // dwMaxIFSD (254)
-                CCID_DESC_MAX_IFSD[0],
-                CCID_DESC_MAX_IFSD[1],
-                CCID_DESC_MAX_IFSD[2],
-                CCID_DESC_MAX_IFSD[3],
-                // dwSyncProtocols: none
-                CCID_DESC_SYNC_PROTOCOLS[0],
-                CCID_DESC_SYNC_PROTOCOLS[1],
-                CCID_DESC_SYNC_PROTOCOLS[2],
-                CCID_DESC_SYNC_PROTOCOLS[3],
-                // dwMechanical: no special characteristics
-                CCID_DESC_MECHANICAL[0],
-                CCID_DESC_MECHANICAL[1],
-                CCID_DESC_MECHANICAL[2],
-                CCID_DESC_MECHANICAL[3],
-                // dwFeatures, see following comments
-                // Auto configuration based on ATR
-                // Auto activation on insert
-                // Auto voltage selection
-                // Auto clock change
-                // Auto baud rate change
-                // Auto parameter negotiation made by CCID
-                // Short and extended APDU level exchange
-                // 0xFE, 0x00, 0x04, 0x00,
-                // ICCD: lower word (=0840): only requests valid for USB-ICC
-                // upper word: 0000 = char level, 0002 = short APDU, 0004 = short+exteded APDU
-                CCID_DESC_FEATURES[0],
-                CCID_DESC_FEATURES[1],
-                CCID_DESC_FEATURES[2],
-                CCID_DESC_FEATURES[3],
-                // dwMaxCCIDMsgLen (3072)
-                // gnuk: 271
-                CCID_DESC_MAX_MSG_LENGTH_LE[0],
-                CCID_DESC_MAX_MSG_LENGTH_LE[1],
-                CCID_DESC_MAX_MSG_LENGTH_LE[2],
-                CCID_DESC_MAX_MSG_LENGTH_LE[3],
-                // bClassGetResponse ("echo"), as per ICCD spec
-                CCID_DESC_CLASS_GET_RESPONSE,
-                // bClassEnvelope ("echo"), as per ICCD spec, gnuk: 0
-                CCID_DESC_CLASS_ENVELOPE,
-                // wlcdLayout (none)
-                CCID_DESC_LCD_LAYOUT[0],
-                CCID_DESC_LCD_LAYOUT[1],
-                // bPinSupport
-                // ICCD: "No PIN pad, not relevant, fixed for legacy reasons"
-                CCID_DESC_PIN_SUPPORT,
-                // bMaxCCIDBusySlots
-                CCID_DESC_MAX_BUSY_SLOTS,
-            ],
+            ccid_descriptor,
         }
     }
 }
