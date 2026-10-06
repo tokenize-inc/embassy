@@ -1053,16 +1053,16 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 Ok(Chain::Begins) => {
                     trace!("CCID: Received XfrBlock with chaining, waiting for more packets");
 
-                    // If the outbox is None, we create a new RawPacket with the data from the command. If it's Some, we append the data from the command to the existing outbox packet.
+                    // If the outbox is None, we start a new application buffer with the data from the command. If it's Some, we append the data from the command to the existing outbox packet.
+                    // The fragment can carry up to MAX_MSG_LENGTH - CCID_HEADER_LEN bytes, so it is
+                    // copied straight into the boxed buffer rather than through a USB-packet-sized RawPacket.
                     if let Some(outbox) = self.outbox.take() {
                         let mut temp = outbox.to_vec();
                         temp.extend_from_slice(command.data());
                         let temp_boxed = temp.into_boxed_slice();
                         self.outbox = Some(temp_boxed);
                     } else {
-                        let data = RawPacket::from_slice(command.data()).map_err(|_| ReadError::BufferOverflow)?;
-
-                        self.outbox = Some(data.as_slice().to_vec().into_boxed_slice());
+                        self.outbox = Some(command.data().to_vec().into_boxed_slice());
                     }
 
                     self.state = CcidReaderState::Receiving;
