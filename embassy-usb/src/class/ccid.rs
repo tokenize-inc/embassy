@@ -816,7 +816,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                             control_abort
                         );
                         let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
-                        packet[0] = 0x6c;
+                        packet[0] = 0x81; // bMessageType: RDR_to_PC_SlotStatus
                         packet[6] = self.seq;
                         packet[7] = CCID_CMD_FAIL;
                         packet[8] = PipeError::CmdAborted as u8;
@@ -937,7 +937,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 error!("CCID: Unexpectedly short packet");
                 self.reset_state();
                 let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
-                packet[0] = 0x6c;
+                packet[0] = 0x81; // bMessageType: RDR_to_PC_SlotStatus
                 packet[6] = self.seq;
                 packet[7] = CCID_CMD_FAIL;
                 packet[8] = PipeError::CommandNotSupported as u8;
@@ -947,7 +947,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 info!("CCID: Unknown command {:?}", &_p);
                 self.seq = self.ext_packet[6];
                 let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
-                packet[0] = 0x6c;
+                packet[0] = 0x81; // bMessageType: RDR_to_PC_SlotStatus
                 packet[6] = self.seq;
                 packet[7] = CCID_CMD_FAIL;
                 packet[8] = PipeError::CommandNotSupported as u8;
