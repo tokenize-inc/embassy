@@ -1067,7 +1067,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
 
                     self.state = CcidReaderState::Receiving;
                     Ok(ResponseType::Internal(
-                        self.rdr_to_pc_data_block(&[], Chain::BeginsAndEnds).await,
+                        self.rdr_to_pc_data_block(&[], Chain::ExpectingMore).await,
                     ))
                 }
                 Err(_) => {
