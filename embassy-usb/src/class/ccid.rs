@@ -1035,14 +1035,12 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
     // }
 
     async fn handle_xfer(&mut self, command: XfrBlock) -> Result<ResponseType, ReadError> {
-        trace!(
-            "Current state: {:?}, command chain: {:?}",
-            self.state,
-            command.chain().unwrap()
-        );
+        // Decode once; an unsupported wLevelParameter is Err and must reach the reset paths below.
+        let chain = command.chain();
+        trace!("Current state: {:?}, command chain: {:?}", self.state, chain.ok());
 
         match self.state {
-            CcidReaderState::Idle => match command.chain() {
+            CcidReaderState::Idle => match chain {
                 Ok(Chain::BeginsAndEnds) => {
                     trace!("CCID: Received XfrBlock with no chaining, processing immediately");
                     self.state = CcidReaderState::Processing;
@@ -1083,7 +1081,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     Ok(ResponseType::None)
                 }
             },
-            CcidReaderState::Receiving => match command.chain() {
+            CcidReaderState::Receiving => match chain {
                 Ok(Chain::Continues) => {
                     trace!("CCID: Received XfrBlock with chaining, waiting for more packets");
 
@@ -1141,7 +1139,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 self.reset_state();
                 Ok(ResponseType::None)
             }
-            CcidReaderState::Sending => match command.chain() {
+            CcidReaderState::Sending => match chain {
                 Ok(Chain::ExpectingMore) => {
                     trace!(
                         "CCID: Received XfrBlock while sending, expecting more packets: Sent {} bytes so far",
