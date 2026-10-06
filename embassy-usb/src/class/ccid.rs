@@ -1250,7 +1250,8 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
 
     /// builds a DataRateAndClockFrequency response with the given status and error codes.
     async fn rdr_to_pc_data_rate_and_clock_frequency(&mut self, status_code: u8, error_code: u8) -> ExtPacket {
-        let mut packet = ExtPacket::zeroed_until(17);
+        // Header plus dwClockFrequency and dwDataRate
+        let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN + 8);
         // bMessageType
         packet[0] = 0x84;
         // dwLength of data = 8 bytes
@@ -1272,7 +1273,8 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
 
     /// builds an Escape response with the given status and error codes, and the first 4 bytes of data.
     async fn rdr_to_pc_escape(&mut self, status_code: u8, error_code: u8, data: &[u8; 4]) -> ExtPacket {
-        let mut packet = ExtPacket::zeroed_until(17);
+        // Header plus the 4 abData bytes declared in dwLength
+        let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN + 4);
         // bMessageType
         packet[0] = 0x83;
         // dwLength
