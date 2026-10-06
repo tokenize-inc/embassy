@@ -427,6 +427,10 @@ pub struct CcidReaderWriter<'d, D: Driver<'d>, const READ_N: usize, const WRITE_
     long_packet_missing: usize,
     in_chain: usize,
     started_processing: bool,
+    // bSeq of the XfrBlock whose APDU is currently with the application. Kept separate from
+    // `seq`, which every incoming command overwrites, so the application's response is labelled
+    // with the sequence number of the command it answers.
+    pending_seq: Option<u8>,
     atr: Vec<u8, 32>,
     // The sequence number of the last bulk command if it was an abort command.
     bulk_abort: Option<u8>,
@@ -503,6 +507,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             long_packet_missing: 0,
             in_chain: 0,
             started_processing: false,
+            pending_seq: None,
             atr: Self::construct_t1_atr(),
             bulk_abort: None,
             control_abort: None,
@@ -644,6 +649,16 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         &raw_packet
                     );
 
+                    // Answer the XfrBlock that was dispatched to the application, not whichever
+                    // command arrived most recently.
+                    let response_seq = match self.pending_seq.take() {
+                        Some(seq) => seq,
+                        None => {
+                            warn!("CCID: Application response without a pending XfrBlock");
+                            self.seq
+                        }
+                    };
+
                     // If packet is larger than the max usb size we need to split in into chunks and send with correct chaining
                     if raw_packet.len() > PACKET_SIZE - CCID_HEADER_LEN {
                         trace!("CCID: Packet larger than max USB packet size, splitting into chunks with chaining");
@@ -651,7 +666,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         let max_chunk = PACKET_SIZE - CCID_HEADER_LEN;
                         let chunk = raw_packet[..max_chunk].to_vec();
 
-                        let data = self.rdr_to_pc_data_block(&chunk, Chain::Begins).await;
+                        let data: ExtPacket = DataBlock::new(response_seq, Chain::Begins, &chunk).into();
                         trace!("CCID: Sending Chained response packet to host: {=[u8]:x}", &data);
 
                         if let Err(e) = self.write(&data).await {
@@ -664,7 +679,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     } else {
                         trace!("CCID: Packet fits in single USB packet, sending with beginsAndEnds");
                         // Wrap in a PRDR_to_PC_DataBlock response and send to host
-                        let data = self.rdr_to_pc_data_block(&raw_packet, Chain::BeginsAndEnds).await;
+                        let data: ExtPacket = DataBlock::new(response_seq, Chain::BeginsAndEnds, &raw_packet).into();
                         trace!("CCID: Sending response packet to host: {=[u8]:x}", &data);
 
                         if let Err(e) = self.write(&data).await {
@@ -954,6 +969,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         self.long_packet_missing = 0;
         self.in_chain = 0;
         self.started_processing = false;
+        self.pending_seq = None;
         self.bulk_abort = None;
         self.control_abort = None;
     }
@@ -1030,6 +1046,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 Ok(Chain::BeginsAndEnds) => {
                     trace!("CCID: Received XfrBlock with no chaining, processing immediately");
                     self.state = CcidReaderState::Processing;
+                    self.pending_seq = Some(self.seq);
 
                     Ok(ResponseType::External(
                         ExtPacket::from_slice(command.data()).map_err(|_| ReadError::BufferOverflow)?,
@@ -1097,6 +1114,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         let full_message = outbox.clone();
                         self.outbox = None;
                         self.state = CcidReaderState::Processing;
+                        self.pending_seq = Some(self.seq);
 
                         Ok(ResponseType::External(
                             ExtPacket::from_slice(&full_message).map_err(|_| ReadError::BufferOverflow)?,
