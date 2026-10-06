@@ -1,10 +1,11 @@
 //! USB CCID (Chip Card Interface Device) class implementation.
 extern crate alloc;
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::convert::{TryFrom, TryInto};
 use core::mem::MaybeUninit;
 use core::ops::Range;
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::{self, CriticalSectionRawMutex};
@@ -443,6 +444,9 @@ pub struct CcidReaderWriter<'d, D: Driver<'d>, const READ_N: usize, const WRITE_
     pending_seq: Option<u8>,
     // Limit on the size of an APDU assembled from chained fragments (Config::max_apdu_size).
     max_apdu_size: usize,
+    // Set by the control handler on USB bus reset; the reader then discards all state from the
+    // previous session before handling more traffic.
+    session_reset: Arc<AtomicBool>,
     atr: Vec<u8, 32>,
     // The sequence number of the last bulk command if it was an abort command.
     bulk_abort: Option<u8>,
@@ -454,7 +458,7 @@ fn build<'d, D: Driver<'d>>(
     builder: &mut Builder<'d, D>,
     state: &'d mut State,
     config: Config<'d>,
-) -> (D::EndpointOut, D::EndpointIn, D::EndpointIn) {
+) -> (D::EndpointOut, D::EndpointIn, D::EndpointIn, Arc<AtomicBool>) {
     let mut func = builder.function(USB_CLASS_CCID, USB_SUBCLASS_NONE, USB_PROTOCOL_NONE);
     let mut iface = func.interface();
     let if_num = iface.interface_number();
@@ -482,11 +486,14 @@ fn build<'d, D: Driver<'d>>(
 
     drop(func);
 
-    let control = state.control.write(Control::new(if_num, ccid_descriptor));
+    let session_reset = Arc::new(AtomicBool::new(false));
+    let control = state
+        .control
+        .write(Control::new(if_num, ccid_descriptor, session_reset.clone()));
 
     builder.handler(control);
 
-    (ep_out, ep_in, ep_int_in)
+    (ep_out, ep_in, ep_int_in, session_reset)
 }
 
 impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWriter<'d, D, READ_N, WRITE_N> {
@@ -502,7 +509,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, ApplicationPacket, WRITE_N>,
     ) -> Self {
         let max_apdu_size = config.max_apdu_size;
-        let (ep_out, ep_in, ep_int_in) = build(builder, state, config);
+        let (ep_out, ep_in, ep_int_in, session_reset) = build(builder, state, config);
 
         Self {
             bulk_out: CcidBulkOut { ep_out },
@@ -522,6 +529,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             started_processing: false,
             pending_seq: None,
             max_apdu_size,
+            session_reset,
             atr: Self::construct_t1_atr(),
             bulk_abort: None,
             control_abort: None,
@@ -656,8 +664,21 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         }
 
         loop {
+            // A bus reset may have happened while we were writing to the host.
+            if self.session_reset.swap(false, Ordering::AcqRel) {
+                self.reset_session(app_to_ccid);
+            }
+
             match select(app_to_ccid.receive(), self.read(&mut buf)).await {
                 Either::First(raw_packet) => {
+                    if self.session_reset.swap(false, Ordering::AcqRel) {
+                        // This answers a command from the previous session; the host won't expect it.
+                        trace!("CCID: Dropping application response from before USB reset");
+                        drop(raw_packet);
+                        self.reset_session(app_to_ccid);
+                        continue;
+                    }
+
                     trace!(
                         "CCID: Received packet from application to send to host: {=[u8]:x}",
                         &raw_packet
@@ -727,6 +748,11 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 },
                 Either::Second(Err(e)) => {
                     warn!("CCID: Failed to read packet from host: {:?}", e);
+                    // Disabled means the endpoint went away (bus reset or deconfiguration), which
+                    // ends the session even if no reset was signalled.
+                    if e == ReadError::Disabled || self.session_reset.swap(false, Ordering::AcqRel) {
+                        self.reset_session(app_to_ccid);
+                    }
                 }
             }
         }
@@ -966,6 +992,24 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 Ok(ResponseType::Internal(packet))
             }
         }
+    }
+
+    /// Ends the current USB session: clears message assembly, command chaining and the pending
+    /// response, and drops application responses already queued for the previous session.
+    ///
+    /// A response the application sends later for a pre-reset command cannot be told apart from a
+    /// new-session response, so the application must stop answering on reset (halo does, via
+    /// `USB_CCID_ROUTING_ENDED`).
+    fn reset_session(&mut self, app_to_ccid: &Receiver<'static, CriticalSectionRawMutex, ApplicationPacket, READ_N>) {
+        self.reset_state();
+        let mut dropped = 0;
+        while app_to_ccid.try_receive().is_ok() {
+            dropped += 1;
+        }
+        trace!(
+            "CCID: USB session reset, dropped {} queued application response(s)",
+            dropped
+        );
     }
 
     /// Reset the state of the CCID driver
@@ -1516,14 +1560,21 @@ impl<'d, D: Driver<'d>> CcidBulkOut<'d, D> {
 pub struct Control {
     if_num: InterfaceNumber,
     ccid_descriptor: [u8; CCID_DESC_BLENGTH as usize],
+    // Shared with the reader; set on USB bus reset.
+    session_reset: Arc<AtomicBool>,
 }
 
 impl Control {
     /// Creates a new Control handler that reports `ccid_descriptor` for GET_DESCRIPTOR requests.
-    pub fn new(if_num: InterfaceNumber, ccid_descriptor: [u8; CCID_DESC_BLENGTH as usize]) -> Self {
+    pub fn new(
+        if_num: InterfaceNumber,
+        ccid_descriptor: [u8; CCID_DESC_BLENGTH as usize],
+        session_reset: Arc<AtomicBool>,
+    ) -> Self {
         Control {
             if_num,
             ccid_descriptor,
+            session_reset,
         }
     }
 }
@@ -1531,6 +1582,7 @@ impl Control {
 impl Handler for Control {
     fn reset(&mut self) {
         trace!("CCID reset");
+        self.session_reset.store(true, Ordering::Release);
     }
 
     fn control_out(&mut self, req: Request, data: &[u8]) -> Option<OutResponse> {
