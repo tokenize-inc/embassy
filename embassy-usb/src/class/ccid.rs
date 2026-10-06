@@ -174,8 +174,8 @@ pub const CCID_DESC_NUM_CLOCK_SUPPORTED: u8 = 0x00;
 pub const CCID_DESC_DATA_RATE_BPS: [u8; 4] = [0x80, 0x25, 0x00, 0x00];
 /// bNumDataRatesSupported
 pub const CCID_DESC_NUM_DATA_RATES_SUPPORTED: u8 = 0x00;
-/// 254
-pub const CCID_DESC_MAX_IFSD: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+/// dwMaxIFSD: 254, the maximum T=1 IFSD
+pub const CCID_DESC_MAX_IFSD: [u8; 4] = 254u32.to_le_bytes();
 /// dwSyncProtocols: none
 pub const CCID_DESC_SYNC_PROTOCOLS: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
 /// dwMechanical: no special characteristics
