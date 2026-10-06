@@ -62,8 +62,10 @@ enum PipeError {
 pub enum ResponseType {
     /// Send to the usb endpoint directly
     Internal(ExtPacket),
-    /// Send to the application to handle
-    External(ExtPacket),
+    /// Send to the application to handle. Holds a complete APDU, which may be assembled from
+    /// several chained CCID messages and so can exceed `MAX_MSG_LENGTH` (bounded by
+    /// `Config::max_apdu_size`).
+    External(ApplicationPacket),
     /// No response needed, e.g. for ABORT commands
     None,
 }
@@ -716,9 +718,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                             "CCID: Received packet from host to send to application: {=[u8]:x}",
                             &packet
                         );
-                        self.ccid_to_app
-                            .send(packet.as_slice().to_vec().into_boxed_slice())
-                            .await;
+                        self.ccid_to_app.send(packet).await;
                         trace!("CCID: Sent packet to application");
                     }
                     ResponseType::None => {
@@ -1102,9 +1102,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     self.state = CcidReaderState::Processing;
                     self.pending_seq = Some(self.seq);
 
-                    Ok(ResponseType::External(
-                        ExtPacket::from_slice(command.data()).map_err(|_| ReadError::BufferOverflow)?,
-                    ))
+                    Ok(ResponseType::External(command.data().to_vec().into_boxed_slice()))
                 }
                 Ok(Chain::Begins) => {
                     trace!("CCID: Received XfrBlock with chaining, waiting for more packets");
@@ -1160,9 +1158,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         self.state = CcidReaderState::Processing;
                         self.pending_seq = Some(self.seq);
 
-                        Ok(ResponseType::External(
-                            ExtPacket::from_slice(&full_message).map_err(|_| ReadError::BufferOverflow)?,
-                        ))
+                        Ok(ResponseType::External(full_message))
                     } else {
                         error!("Received chained packet but outbox is None");
                         self.reset_state();
