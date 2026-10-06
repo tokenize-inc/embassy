@@ -402,10 +402,14 @@ impl Default for ProtocolData {
     }
 }
 /// USB CCID reader/writer.
+///
+/// `READ_N` and `WRITE_N` are the capacities, in messages, of the application channels
+/// (`app_to_ccid` and `ccid_to_app`). They do not limit USB packet or CCID message sizes,
+/// which are bounded by [`PACKET_SIZE`] and [`MAX_MSG_LENGTH`].
 pub struct CcidReaderWriter<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> {
-    bulk_out: CcidBulkOut<'d, D, READ_N>,
-    bulk_in: CcidBulkIn<'d, D, WRITE_N>,
-    int_in: CcidIntIn<'d, D, READ_N>,
+    bulk_out: CcidBulkOut<'d, D>,
+    bulk_in: CcidBulkIn<'d, D>,
+    int_in: CcidIntIn<'d, D>,
 
     protocol_data: ProtocolData,
 
@@ -580,7 +584,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
     }
 
     /// Splits into separate readers/writers for input and output reports.
-    pub fn split(self) -> (CcidBulkOut<'d, D, READ_N>, CcidBulkIn<'d, D, WRITE_N>) {
+    pub fn split(self) -> (CcidBulkOut<'d, D>, CcidBulkIn<'d, D>) {
         (self.bulk_out, self.bulk_in)
     }
 
@@ -625,7 +629,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         mut self,
         app_to_ccid: &'static mut Receiver<'static, CriticalSectionRawMutex, ApplicationPacket, READ_N>,
     ) -> ! {
-        let mut buf = [0u8; READ_N];
+        let mut buf = [0u8; PACKET_SIZE];
 
         self.ready().await;
 
@@ -1281,7 +1285,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
 }
 
 /// USB CCID writer.
-pub struct CcidBulkIn<'d, D: Driver<'d>, const N: usize> {
+pub struct CcidBulkIn<'d, D: Driver<'d>> {
     ep_in: D::EndpointIn,
 }
 
@@ -1303,13 +1307,13 @@ pub enum CcidReaderState {
 }
 
 /// Bulk Out endpoint for receiving CCID commands from the host.
-pub struct CcidBulkOut<'d, D: Driver<'d>, const N: usize> {
+pub struct CcidBulkOut<'d, D: Driver<'d>> {
     ep_out: D::EndpointOut,
     offset: &'d AtomicUsize,
 }
 
 /// USB CCID interrupt endpoint.
-pub struct CcidIntIn<'d, D: Driver<'d>, const N: usize> {
+pub struct CcidIntIn<'d, D: Driver<'d>> {
     ep_int_in: D::EndpointIn,
 }
 
@@ -1335,7 +1339,7 @@ impl From<EndpointError> for ReadError {
     }
 }
 
-impl<'d, D: Driver<'d>, const N: usize> CcidIntIn<'d, D, N> {
+impl<'d, D: Driver<'d>> CcidIntIn<'d, D> {
     /// Waits for the interrupt in endpoint to be enabled.
     pub async fn ready(&mut self) {
         self.ep_int_in.wait_enabled().await;
@@ -1343,10 +1347,10 @@ impl<'d, D: Driver<'d>, const N: usize> CcidIntIn<'d, D, N> {
 
     /// Writes `report` to its interrupt endpoint.
     pub async fn write(&mut self, report: &[u8]) -> Result<(), EndpointError> {
-        assert!(report.len() <= N);
+        assert!(report.len() <= PACKET_SIZE);
 
         let max_packet_size = usize::from(self.ep_int_in.info().max_packet_size);
-        let zlp_needed = report.len() < N && (report.len() % max_packet_size == 0);
+        let zlp_needed = report.len() < PACKET_SIZE && (report.len() % max_packet_size == 0);
         for chunk in report.chunks(max_packet_size) {
             trace!(
                 "CCID: Writing interrupt chunk to host: {=[u8]:x}, {}",
@@ -1365,7 +1369,7 @@ impl<'d, D: Driver<'d>, const N: usize> CcidIntIn<'d, D, N> {
     }
 }
 
-impl<'d, D: Driver<'d>, const N: usize> CcidBulkIn<'d, D, N> {
+impl<'d, D: Driver<'d>> CcidBulkIn<'d, D> {
     /// Waits for the interrupt in endpoint to be enabled.
     pub async fn ready(&mut self) {
         self.ep_in.wait_enabled().await;
@@ -1374,7 +1378,7 @@ impl<'d, D: Driver<'d>, const N: usize> CcidBulkIn<'d, D, N> {
     /// Writes `report` to its interrupt endpoint.
     pub async fn write(&mut self, report: &[u8]) -> Result<(), EndpointError> {
         trace!("CCID: Writing report to host: {=[u8]:x}, {}", report, report.len());
-        assert!(report.len() <= N);
+        assert!(report.len() <= MAX_MSG_LENGTH);
 
         let max_packet_size = usize::from(self.ep_in.info().max_packet_size);
         trace!("CCID: Endpoint max packet size: {}", max_packet_size);
@@ -1393,7 +1397,7 @@ impl<'d, D: Driver<'d>, const N: usize> CcidBulkIn<'d, D, N> {
     }
 }
 
-impl<'d, D: Driver<'d>, const N: usize> CcidBulkOut<'d, D, N> {
+impl<'d, D: Driver<'d>> CcidBulkOut<'d, D> {
     /// Waits for the interrupt out endpoint to be enabled.
     pub async fn ready(&mut self) {
         self.ep_out.wait_enabled().await;
@@ -1401,7 +1405,9 @@ impl<'d, D: Driver<'d>, const N: usize> CcidBulkOut<'d, D, N> {
 
     /// Reads an output report from the Interrupt Out pipe.
     ///
-    /// **Note:** If `N` > the maximum packet size of the endpoint (i.e. output
+    /// Reads until a short packet is received or `buf` is full.
+    ///
+    /// **Note:** If `buf` is larger than the maximum packet size of the endpoint (i.e. output
     /// reports may be split across multiple packets) and this method's future
     /// is dropped after some packets have been read, the next call to `read()`
     /// will return a [`ReadError::Sync`]. The range in the sync error
@@ -1409,8 +1415,8 @@ impl<'d, D: Driver<'d>, const N: usize> CcidBulkOut<'d, D, N> {
     /// `read()`. If the dropped future used the same `buf`, then `buf` will
     /// contain the full report.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
-        assert!(N != 0);
-        assert!(buf.len() >= N);
+        assert!(!buf.is_empty());
+        let limit = buf.len();
 
         // Read packets from the endpoint
         let max_packet_size = usize::from(self.ep_out.info().max_packet_size);
@@ -1418,14 +1424,14 @@ impl<'d, D: Driver<'d>, const N: usize> CcidBulkOut<'d, D, N> {
         let mut total = starting_offset;
 
         loop {
-            for chunk in buf[starting_offset..N].chunks_mut(max_packet_size) {
+            for chunk in buf[starting_offset..limit].chunks_mut(max_packet_size) {
                 match self.ep_out.read(chunk).await {
                     Ok(size) => {
                         trace!("CCID Read chunk of size {} from host", size);
                         trace!("CCID Read chunk: {=[u8]:x}", &chunk[..size]);
 
                         total += size;
-                        if size < max_packet_size || total == N {
+                        if size < max_packet_size || total == limit {
                             self.offset.store(0, Ordering::Release);
                             break;
                         }
@@ -1437,8 +1443,8 @@ impl<'d, D: Driver<'d>, const N: usize> CcidBulkOut<'d, D, N> {
                         match read_error {
                             ReadError::BufferOverflow => {
                                 error!(
-                                    "Host sent output report larger than the configured maximum output report length ({})",
-                                    N
+                                    "Host sent output report larger than the read buffer ({})",
+                                    limit
                                 );
                             }
                             ReadError::Disabled => {
