@@ -1452,7 +1452,9 @@ impl<'d, D: Driver<'d>> CcidBulkIn<'d, D> {
 
         let max_packet_size = usize::from(self.ep_in.info().max_packet_size);
         trace!("CCID: Endpoint max packet size: {}", max_packet_size);
-        let zlp_needed = report.len() == max_packet_size;
+        // A transfer that ends on a full packet must be terminated with a ZLP, otherwise a host
+        // read sized for a longer message (up to dwMaxCCIDMessageLength) keeps waiting for data.
+        let zlp_needed = !report.is_empty() && report.len() % max_packet_size == 0;
         for chunk in report.chunks(max_packet_size) {
             trace!("CCID: Writing chunk to host: {=[u8]:x}, {}", chunk, chunk.len());
             self.ep_in.write(chunk).await?;
