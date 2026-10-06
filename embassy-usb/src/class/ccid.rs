@@ -583,9 +583,10 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         atr
     }
 
-    /// Splits into separate readers/writers for input and output reports.
-    pub fn split(self) -> (CcidBulkOut<'d, D>, CcidBulkIn<'d, D>) {
-        (self.bulk_out, self.bulk_in)
+    /// Splits into the bulk OUT reader, the bulk IN writer, and the interrupt IN writer
+    /// (used for RDR_to_PC_NotifySlotChange notifications).
+    pub fn split(self) -> (CcidBulkOut<'d, D>, CcidBulkIn<'d, D>, CcidIntIn<'d, D>) {
+        (self.bulk_out, self.bulk_in, self.int_in)
     }
 
     /// Waits for both IN and OUT endpoints to be enabled.
