@@ -298,19 +298,23 @@ pub const DEFAULT_CCID_DESCRIPTOR: [u8; CCID_DESC_BLENGTH as usize] = [
     CCID_DESC_MAX_BUSY_SLOTS,
 ];
 
-/// Default value for bmFindexDindex, meaning that the CCID does not support any automatic features based on the ATR, and that the host should use the default values for the other protocol parameters.
+// T=1 protocol parameters reported by GetParameters. These must agree with the ATR built by
+// `construct_t1_atr`, which uses the same constants for TC1, TA3 and TB3.
+
+/// bmFindexDindex: Fi=372, Di=1. The ATR has no TA1, so the implicit default 0x11 applies.
 pub const DEFAULT_FIDI: u8 = 0x11;
-/// Default value for bmTCCKST0, meaning that the CCID does not support any of the T=0 specific features.
-pub const DEFAULT_T01CONVCHECKSUM: u8 = 0x00;
-/// Default value for bGuardTimeT0, meaning that the CCID does not support extra guard time for T=0.
+/// bmTCCKST1: LRC checksum (bit 0 = 0), direct convention (bit 1 = 0, TS = 0x3B);
+/// bits 7..2 are fixed at 000100b by the CCID spec.
+pub const DEFAULT_TCCKST1: u8 = 0x10;
+/// bGuardTimeT1: extra guard time from TC1 (none).
 pub const DEFAULT_EXTRA_GUARDTIME: u8 = 0x00;
-/// Default value for bWaitingIntegerT0, meaning that the CCID does not support waiting time extensions for T=0.
-pub const DEFAULT_WAITINGINTEGER: u8 = 0x0A;
-/// Default value for bClockStop, meaning that the CCID does not support clock stop on T=0. This is a bitfield, where bit 0 set means that the CCID supports clock stop when the card is active, and bit 1 set means that the CCID supports clock stop when the card is inactive.
+/// bWaitingIntegersT1: from TB3, BWI = 1 (high nibble), CWI = 5 (low nibble).
+pub const DEFAULT_WAITING_INTEGERS_T1: u8 = 0x15;
+/// bClockStop: clock stop not supported.
 pub const DEFAULT_CLOCKSTOP: u8 = 0x00;
-/// Default value for bIFSC, meaning that the CCID supports the default IFSC of 0x20 for T=1.
-pub const DEFAULT_IFSC: u8 = 0x20;
-/// Default value for bNAD, meaning that the CCID does not support NAD values in T=1.
+/// bIFSC: information field size from TA3 (254).
+pub const DEFAULT_IFSC: u8 = 0xFE;
+/// bNadValue: NAD not used.
 pub const DEFAULT_NAD: u8 = 0x00;
 
 /// Configuration for the CCID reader/writer.
@@ -372,12 +376,13 @@ impl State {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-/// atr protocol data, as per CCID spec, returned in response to the GetParameters command and in the SlotStatus response when a card is inserted or reset. This is used by the host to determine the communication parameters to use with the card.
+/// T=1 protocol data structure (CCID spec, RDR_to_PC_Parameters), returned in response to the
+/// GetParameters command. The host uses it to determine the active protocol parameters.
 pub struct ProtocolData {
     bm_findex_dindex: u8,
-    bm_tcckst0: u8,
-    b_guard_time_t0: u8,
-    b_waiting_integer_t0: u8,
+    bm_tcckst1: u8,
+    b_guard_time_t1: u8,
+    b_waiting_integers_t1: u8,
     b_clock_stop: u8,
     b_ifsc: u8,
     b_nad: u8,
@@ -386,10 +391,10 @@ pub struct ProtocolData {
 impl Default for ProtocolData {
     fn default() -> Self {
         Self {
-            bm_findex_dindex: 0,
-            bm_tcckst0: 0,
-            b_guard_time_t0: DEFAULT_EXTRA_GUARDTIME,
-            b_waiting_integer_t0: DEFAULT_WAITINGINTEGER,
+            bm_findex_dindex: DEFAULT_FIDI,
+            bm_tcckst1: DEFAULT_TCCKST1,
+            b_guard_time_t1: DEFAULT_EXTRA_GUARDTIME,
+            b_waiting_integers_t1: DEFAULT_WAITING_INTEGERS_T1,
             b_clock_stop: DEFAULT_CLOCKSTOP,
             b_ifsc: DEFAULT_IFSC,
             b_nad: DEFAULT_NAD,
@@ -545,15 +550,15 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
 
         // ---- Interface bytes group 1 ----
         atr.push(0x00).ok(); // TB1 (VPP not connected)
-        atr.push(0x00).ok(); // TC1 (no extra guard time)
+        atr.push(DEFAULT_EXTRA_GUARDTIME).ok(); // TC1 (no extra guard time)
         atr.push(0x81).ok(); // TD1 (T=1, TD2 follows)
 
         // ---- Interface bytes group 2 ----
         atr.push(0x31).ok(); // TD2 (T=1, TA3 and TB3 follow)
 
         // ---- Interface bytes group 3 ----
-        atr.push(0xFE).ok(); // TA3 (IFSC = 254)
-        atr.push(0x15).ok(); // TB3 (BWI=1, CWI=5)
+        atr.push(DEFAULT_IFSC).ok(); // TA3 (IFSC = 254)
+        atr.push(DEFAULT_WAITING_INTEGERS_T1).ok(); // TB3 (BWI=1, CWI=5)
 
         // ---- Add in 0x59 category byte ----
         atr.push(0x59).ok();
@@ -1260,11 +1265,11 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         // bmFindexDindex
         packet[10] = self.protocol_data.bm_findex_dindex;
         // bmTCCKST1
-        packet[11] = self.protocol_data.bm_tcckst0;
+        packet[11] = self.protocol_data.bm_tcckst1;
         // bGuardTimeT1
-        packet[12] = self.protocol_data.b_guard_time_t0;
+        packet[12] = self.protocol_data.b_guard_time_t1;
         // bmWaitingIntegersT1
-        packet[13] = self.protocol_data.b_waiting_integer_t0;
+        packet[13] = self.protocol_data.b_waiting_integers_t1;
         // bClockStop
         packet[14] = self.protocol_data.b_clock_stop;
         // bIFSC
