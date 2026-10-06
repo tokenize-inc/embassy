@@ -1052,6 +1052,19 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 packet[8] = PipeError::CommandNotSupported as u8;
                 Ok(ResponseType::Internal(packet))
             }
+            Err(PacketError::TruncatedPayload) => {
+                error!("CCID: dwLength exceeds the received payload, rejecting command");
+                let seq = self.ext_packet[6];
+                let slot = self.ext_packet[5];
+                self.reset_state();
+                let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
+                packet[0] = 0x81; // bMessageType: RDR_to_PC_SlotStatus
+                packet[5] = slot;
+                packet[6] = seq;
+                packet[7] = CCID_CMD_FAIL;
+                packet[8] = PipeError::BadLength as u8;
+                Ok(ResponseType::Internal(packet))
+            }
             Err(PacketError::WrongSlot(slot)) => {
                 warn!("CCID: Command for nonexistent slot {}", slot);
                 let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
@@ -1807,6 +1820,8 @@ pub enum PacketError {
     UnknownCommand(u8),
     /// The packet addresses a slot above bMaxSlotIndex.
     WrongSlot(u8),
+    /// dwLength declares more payload bytes than the packet contains.
+    TruncatedPayload,
 }
 
 /// A trait for parsing a CCID packet from a raw byte slice. This is implemented for the different command types (e.g. XfrBlock) and provides methods for accessing the header fields and data.
@@ -1828,11 +1843,12 @@ pub trait Packet: core::ops::Deref<Target = ExtPacket> {
 /// A trait for packets that contain data. This provides a method for accessing the data portion of the packet, which is the bytes after the 10-byte header. The length of the data is determined by the length field in the header (bytes 1-4), but this implementation also ensures that we don't return more than `MAX_MSG_LENGTH - CCID_HEADER_LEN` bytes to avoid overflowing our buffers.
 pub trait PacketWithData: Packet {
     #[inline]
-    /// Returns the data portion of the packet as a byte slice. The length of the data is determined by the length field in the header (bytes 1-4), but this implementation also ensures that we don't return more than `MAX_MSG_LENGTH - CCID_HEADER_LEN` bytes to avoid overflowing our buffers.
+    /// Returns the data portion of the packet as a byte slice, as declared by the length field in
+    /// the header (bytes 1-4). `Command::try_from` rejects packets whose dwLength exceeds the
+    /// received payload, so the declared length always fits.
     fn data(&self) -> &[u8] {
         let declared_len = u32::from_le_bytes(self[1..5].try_into().unwrap()) as usize;
-        let len = core::cmp::min(MAX_MSG_LENGTH - CCID_HEADER_LEN, declared_len);
-        &self[CCID_HEADER_LEN..][..len]
+        &self[CCID_HEADER_LEN..][..declared_len]
     }
 }
 
@@ -2062,6 +2078,10 @@ macro_rules! command_message {
                 }
                 if packet[5] > CCID_DESC_MAX_SLOT_INDEX {
                     return Err(PacketError::WrongSlot(packet[5]));
+                }
+                // PacketWithData::data() relies on dwLength fitting the received payload.
+                if packet.data_len() > packet.len() - CCID_HEADER_LEN {
+                    return Err(PacketError::TruncatedPayload);
                 }
                 let command_byte = packet[0];
                 Ok(match command_byte {
