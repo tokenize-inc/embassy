@@ -52,6 +52,8 @@ enum PipeError {
     XfrParityError = 0xfd,
     //..
     CmdSlotBusy = 0xE0,
+    // Offset of the offending field in the command: dwLength.
+    BadLength = 0x01,
     CommandNotSupported = 0x00,
 }
 
@@ -336,6 +338,12 @@ pub struct Config<'d> {
     /// of CPU on the device & bandwidth on the bus. A value of 10 is reasonable for
     /// high performance uses, and a value of 255 is good for best-effort usecases.
     pub poll_ms: u8,
+
+    /// Maximum size, in bytes, of an APDU assembled from chained XfrBlock fragments.
+    ///
+    /// The assembled APDU is heap-allocated, so this bounds how much memory a host can make the
+    /// driver allocate. Chains that would exceed it are rejected and the reader is reset.
+    pub max_apdu_size: usize,
 }
 
 /// Report ID
@@ -431,6 +439,8 @@ pub struct CcidReaderWriter<'d, D: Driver<'d>, const READ_N: usize, const WRITE_
     // `seq`, which every incoming command overwrites, so the application's response is labelled
     // with the sequence number of the command it answers.
     pending_seq: Option<u8>,
+    // Limit on the size of an APDU assembled from chained fragments (Config::max_apdu_size).
+    max_apdu_size: usize,
     atr: Vec<u8, 32>,
     // The sequence number of the last bulk command if it was an abort command.
     bulk_abort: Option<u8>,
@@ -489,6 +499,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         config: Config<'d>,
         ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, ApplicationPacket, WRITE_N>,
     ) -> Self {
+        let max_apdu_size = config.max_apdu_size;
         let (ep_out, ep_in, ep_int_in) = build(builder, state, config);
 
         Self {
@@ -508,6 +519,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             in_chain: 0,
             started_processing: false,
             pending_seq: None,
+            max_apdu_size,
             atr: Self::construct_t1_atr(),
             bulk_abort: None,
             control_abort: None,
@@ -1034,6 +1046,50 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
     //     self.outbox = Some(primed_packet.into());
     // }
 
+    /// Appends a command-chain fragment to the APDU being assembled in `outbox`.
+    ///
+    /// Checks `max_apdu_size` and reserves memory fallibly before growing the buffer, so a host
+    /// cannot exhaust the heap with an unbounded chain. Returns `false` if the fragment was
+    /// rejected.
+    fn append_chain_fragment(&mut self, fragment: &[u8]) -> bool {
+        let mut apdu = self.outbox.take().map(|apdu| apdu.into_vec()).unwrap_or_default();
+        let fits = apdu
+            .len()
+            .checked_add(fragment.len())
+            .is_some_and(|len| len <= self.max_apdu_size);
+        if !fits {
+            error!(
+                "CCID: Chained APDU exceeds the maximum of {} bytes ({} + {})",
+                self.max_apdu_size,
+                apdu.len(),
+                fragment.len()
+            );
+            return false;
+        }
+        if apdu.try_reserve_exact(fragment.len()).is_err() {
+            error!("CCID: Out of memory assembling a {} byte chained APDU", apdu.len() + fragment.len());
+            return false;
+        }
+        apdu.extend_from_slice(fragment);
+        self.outbox = Some(apdu.into_boxed_slice());
+        true
+    }
+
+    /// Resets the reader after a rejected command chain and builds a failed
+    /// RDR_to_PC_DataBlock for the current XfrBlock.
+    fn reject_chain(&mut self) -> ResponseType {
+        let seq = self.seq;
+        let slot = self.slot;
+        self.reset_state();
+        let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
+        packet[0] = 0x80; // bMessageType: RDR_to_PC_DataBlock
+        packet[5] = slot;
+        packet[6] = seq;
+        packet[7] = CCID_CMD_FAIL;
+        packet[8] = PipeError::BadLength as u8;
+        ResponseType::Internal(packet)
+    }
+
     async fn handle_xfer(&mut self, command: XfrBlock) -> Result<ResponseType, ReadError> {
         // Decode once; an unsupported wLevelParameter is Err and must reach the reset paths below.
         let chain = command.chain();
@@ -1053,16 +1109,10 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 Ok(Chain::Begins) => {
                     trace!("CCID: Received XfrBlock with chaining, waiting for more packets");
 
-                    // If the outbox is None, we start a new application buffer with the data from the command. If it's Some, we append the data from the command to the existing outbox packet.
                     // The fragment can carry up to MAX_MSG_LENGTH - CCID_HEADER_LEN bytes, so it is
                     // copied straight into the boxed buffer rather than through a USB-packet-sized RawPacket.
-                    if let Some(outbox) = self.outbox.take() {
-                        let mut temp = outbox.to_vec();
-                        temp.extend_from_slice(command.data());
-                        let temp_boxed = temp.into_boxed_slice();
-                        self.outbox = Some(temp_boxed);
-                    } else {
-                        self.outbox = Some(command.data().to_vec().into_boxed_slice());
+                    if !self.append_chain_fragment(command.data()) {
+                        return Ok(self.reject_chain());
                     }
 
                     self.state = CcidReaderState::Receiving;
@@ -1085,15 +1135,13 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 Ok(Chain::Continues) => {
                     trace!("CCID: Received XfrBlock with chaining, waiting for more packets");
 
-                    if let Some(outbox) = self.outbox.take() {
-                        let mut temp = outbox.to_vec();
-                        temp.extend_from_slice(command.data());
-                        let temp_boxed = temp.into_boxed_slice();
-                        self.outbox = Some(temp_boxed);
-                    } else {
+                    if self.outbox.is_none() {
                         error!("Received chained packet but outbox is None");
                         self.reset_state();
                         return Ok(ResponseType::None);
+                    }
+                    if !self.append_chain_fragment(command.data()) {
+                        return Ok(self.reject_chain());
                     }
 
                     Ok(ResponseType::Internal(
@@ -1103,14 +1151,12 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 Ok(Chain::Ends) => {
                     trace!("CCID: Received last XfrBlock in chain, processing full message");
 
-                    if let Some(outbox) = self.outbox.take() {
-                        let mut temp = outbox.to_vec();
-                        temp.extend_from_slice(command.data());
-                        let temp_boxed = temp.into_boxed_slice();
-                        self.outbox = Some(temp_boxed);
+                    if self.outbox.is_some() {
+                        if !self.append_chain_fragment(command.data()) {
+                            return Ok(self.reject_chain());
+                        }
 
-                        let full_message = outbox.clone();
-                        self.outbox = None;
+                        let full_message = self.outbox.take().unwrap_or_default();
                         self.state = CcidReaderState::Processing;
                         self.pending_seq = Some(self.seq);
 
