@@ -7,9 +7,10 @@ use core::mem::MaybeUninit;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select3, Either3};
 use embassy_sync::blocking_mutex::raw::{self, CriticalSectionRawMutex};
 use embassy_sync::channel::{Receiver, Sender};
+use embassy_sync::signal::Signal;
 use heapless::Vec;
 
 use crate::control::{InResponse, OutResponse, Recipient, Request, RequestType};
@@ -57,6 +58,17 @@ enum PipeError {
     BadLength = 0x01,
     CommandNotSupported = 0x00,
 }
+
+/// One half of the CCID ABORT handshake: the slot and sequence number being aborted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub(crate) struct AbortRequest {
+    slot: u8,
+    seq: u8,
+}
+
+/// Signal used by the control handler to pass a class-specific ABORT request to the reader.
+pub(crate) type AbortSignal = Signal<CriticalSectionRawMutex, AbortRequest>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// CCID Response type
@@ -448,17 +460,29 @@ pub struct CcidReaderWriter<'d, D: Driver<'d>, const READ_N: usize, const WRITE_
     // previous session before handling more traffic.
     session_reset: Arc<AtomicBool>,
     atr: Vec<u8, 32>,
-    // The sequence number of the last bulk command if it was an abort command.
-    bulk_abort: Option<u8>,
-    // The sequence number of the last abort command received over the control pipe, if any.
-    control_abort: Option<u8>,
+    // Bulk-pipe half of a pending ABORT handshake (PC_to_RDR_Abort received).
+    bulk_abort: Option<AbortRequest>,
+    // Control-pipe half of a pending ABORT handshake (class request ABORT received).
+    control_abort: Option<AbortRequest>,
+    // Control-pipe ABORT requests, signalled by the control handler.
+    abort_signal: Arc<AbortSignal>,
+    // An ABORT cancelled a command that was already with the application. Its response is
+    // dropped when it arrives, and new XfrBlocks are rejected as busy until then, so it can't be
+    // mistaken for the response to a later command.
+    discard_app_response: bool,
 }
 
 fn build<'d, D: Driver<'d>>(
     builder: &mut Builder<'d, D>,
     state: &'d mut State,
     config: Config<'d>,
-) -> (D::EndpointOut, D::EndpointIn, D::EndpointIn, Arc<AtomicBool>) {
+) -> (
+    D::EndpointOut,
+    D::EndpointIn,
+    D::EndpointIn,
+    Arc<AtomicBool>,
+    Arc<AbortSignal>,
+) {
     let mut func = builder.function(USB_CLASS_CCID, USB_SUBCLASS_NONE, USB_PROTOCOL_NONE);
     let mut iface = func.interface();
     let if_num = iface.interface_number();
@@ -487,13 +511,17 @@ fn build<'d, D: Driver<'d>>(
     drop(func);
 
     let session_reset = Arc::new(AtomicBool::new(false));
-    let control = state
-        .control
-        .write(Control::new(if_num, ccid_descriptor, session_reset.clone()));
+    let abort_signal = Arc::new(AbortSignal::new());
+    let control = state.control.write(Control::new(
+        if_num,
+        ccid_descriptor,
+        session_reset.clone(),
+        abort_signal.clone(),
+    ));
 
     builder.handler(control);
 
-    (ep_out, ep_in, ep_int_in, session_reset)
+    (ep_out, ep_in, ep_int_in, session_reset, abort_signal)
 }
 
 impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWriter<'d, D, READ_N, WRITE_N> {
@@ -509,7 +537,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, ApplicationPacket, WRITE_N>,
     ) -> Self {
         let max_apdu_size = config.max_apdu_size;
-        let (ep_out, ep_in, ep_int_in, session_reset) = build(builder, state, config);
+        let (ep_out, ep_in, ep_int_in, session_reset, abort_signal) = build(builder, state, config);
 
         Self {
             bulk_out: CcidBulkOut { ep_out },
@@ -533,6 +561,8 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             atr: Self::construct_t1_atr(),
             bulk_abort: None,
             control_abort: None,
+            abort_signal,
+            discard_app_response: false,
             ccid_to_app,
             protocol_data: ProtocolData::default(),
         }
@@ -669,13 +699,20 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 self.reset_session(app_to_ccid);
             }
 
-            match select(app_to_ccid.receive(), self.read(&mut buf)).await {
-                Either::First(raw_packet) => {
+            let abort_signal = self.abort_signal.clone();
+            match select3(app_to_ccid.receive(), self.read(&mut buf), abort_signal.wait()).await {
+                Either3::First(raw_packet) => {
                     if self.session_reset.swap(false, Ordering::AcqRel) {
                         // This answers a command from the previous session; the host won't expect it.
                         trace!("CCID: Dropping application response from before USB reset");
                         drop(raw_packet);
                         self.reset_session(app_to_ccid);
+                        continue;
+                    }
+                    if self.discard_app_response {
+                        // This answers a command the host has aborted.
+                        trace!("CCID: Dropping application response to aborted command");
+                        self.discard_app_response = false;
                         continue;
                     }
 
@@ -723,7 +760,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         self.state = CcidReaderState::Idle;
                     }
                 }
-                Either::Second(Ok(response_type)) => match response_type {
+                Either3::Second(Ok(response_type)) => match response_type {
                     ResponseType::Internal(packet) => {
                         trace!(
                             "CCID: Received packet from host to send back to host: {=[u8]:x}",
@@ -746,12 +783,27 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         trace!("CCID: Nothing to handle")
                     }
                 },
-                Either::Second(Err(e)) => {
+                Either3::Second(Err(e)) => {
                     warn!("CCID: Failed to read packet from host: {:?}", e);
                     // Disabled means the endpoint went away (bus reset or deconfiguration), which
                     // ends the session even if no reset was signalled.
                     if e == ReadError::Disabled || self.session_reset.swap(false, Ordering::AcqRel) {
                         self.reset_session(app_to_ccid);
+                    }
+                }
+                Either3::Third(request) => {
+                    trace!(
+                        "CCID: Control ABORT for slot {} seq {}",
+                        request.slot,
+                        request.seq
+                    );
+                    self.control_abort = Some(request);
+                    // The bulk half may already have arrived and be waiting for this one.
+                    if self.bulk_abort == Some(request) {
+                        let packet = self.abort(request);
+                        if let Err(e) = self.write(&packet).await {
+                            warn!("CCID: Failed to write ABORT response: {:?}", e);
+                        }
                     }
                 }
             }
@@ -843,23 +895,38 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 self.seq = command.seq();
                 self.slot = command.slot();
 
-                // If we receive an ABORT on the control pipe, we reject all further commands until
-                // we receive a matching ABORT on the bulk endpoint too.
-                if let Some(control_abort) = self.control_abort {
-                    if matches!(command, Command::Abort(_)) && control_abort == self.seq {
-                        return Ok(ResponseType::Internal(self.abort()));
-                    } else {
-                        trace!(
-                            "CCID: Received command while waiting for bulk abort with seq {}, rejecting",
-                            control_abort
-                        );
-                        let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
-                        packet[0] = 0x81; // bMessageType: RDR_to_PC_SlotStatus
-                        packet[6] = self.seq;
-                        packet[7] = CCID_CMD_FAIL;
-                        packet[8] = PipeError::CmdAborted as u8;
-                        return Ok(ResponseType::Internal(packet));
+                // ABORT is a two-part handshake (control request + PC_to_RDR_Abort) that may arrive
+                // in either order. Only complete it when both halves name the same slot and seq.
+                if matches!(command, Command::Abort(_)) {
+                    let request = AbortRequest {
+                        slot: self.slot,
+                        seq: self.seq,
+                    };
+                    self.bulk_abort = Some(request);
+                    if self.control_abort == Some(request) {
+                        return Ok(ResponseType::Internal(self.abort(request)));
                     }
+                    trace!(
+                        "CCID: Bulk ABORT for slot {} seq {}, waiting for control ABORT",
+                        request.slot,
+                        request.seq
+                    );
+                    return Ok(ResponseType::None);
+                }
+
+                // Once the control pipe has announced an ABORT, reject all other commands until
+                // the matching bulk ABORT arrives.
+                if let Some(control_abort) = self.control_abort {
+                    trace!(
+                        "CCID: Received command while waiting for bulk abort with seq {}, rejecting",
+                        control_abort.seq
+                    );
+                    let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
+                    packet[0] = 0x81; // bMessageType: RDR_to_PC_SlotStatus
+                    packet[6] = self.seq;
+                    packet[7] = CCID_CMD_FAIL;
+                    packet[8] = PipeError::CmdAborted as u8;
+                    return Ok(ResponseType::Internal(packet));
                 }
 
                 self.bulk_abort = None;
@@ -890,16 +957,8 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         trace!("CCID: XfrBlock command received, data: {=[u8]:x}", command.data());
                         self.handle_xfer(command).await
                     }
-                    Command::Abort(_command) => {
-                        trace!(
-                            "CCID: Abort command received, expecting matching abort with seq {} on control pipe",
-                            self.seq
-                        );
-                        self.bulk_abort = Some(self.seq);
-                        Ok(ResponseType::Internal(
-                            self.rdr_to_pc_slot_status(self.slot_status, 0x00).await,
-                        ))
-                    }
+                    // Handled above, before the abort-pending check.
+                    Command::Abort(_command) => Ok(ResponseType::None),
                     Command::GetParameters(_command) => {
                         trace!("CCID: GetParameters command received");
                         Ok(ResponseType::Internal(self.rdr_to_pc_parameters(0x0, 0x0).await))
@@ -1002,6 +1061,8 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
     /// `USB_CCID_ROUTING_ENDED`).
     fn reset_session(&mut self, app_to_ccid: &Receiver<'static, CriticalSectionRawMutex, ApplicationPacket, READ_N>) {
         self.reset_state();
+        self.discard_app_response = false;
+        self.abort_signal.reset();
         let mut dropped = 0;
         while app_to_ccid.try_receive().is_ok() {
             dropped += 1;
@@ -1030,23 +1091,24 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         self.control_abort = None;
     }
 
-    // This method performs an abort and should only be called if we received matching ABORT
-    // requests both from the control pipe and from the bulk endpoint.
-    fn abort(&mut self) -> ExtPacket {
-        trace!("CCID: Aborting");
-        // reset state
-        self.bulk_abort = None;
-        self.control_abort = None;
-        self.state = CcidReaderState::Idle;
-        self.outbox = None;
-        self.started_processing = false;
-        self.receiving_long = false;
-        self.long_packet_missing = 0;
+    // Completes an ABORT. Only call this once matching ABORT requests have arrived on both the
+    // control pipe and the bulk endpoint.
+    fn abort(&mut self, request: AbortRequest) -> ExtPacket {
+        trace!("CCID: Aborting slot {} seq {}", request.slot, request.seq);
+        // A command that is already with the application can't be recalled; drop its response
+        // when it arrives instead of sending it.
+        if self.pending_seq.is_some() {
+            self.discard_app_response = true;
+        }
+        // Cancels message assembly, command chaining, a partly sent response and both abort halves.
+        self.reset_state();
 
-        // send response for successful abort
+        // RDR_to_PC_SlotStatus for the bulk ABORT, reporting success
         let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
         packet[0] = 0x81;
-        packet[6] = self.seq;
+        packet[5] = request.slot;
+        packet[6] = request.seq;
+        packet[7] = self.slot_status;
         packet
     }
 
@@ -1119,22 +1181,33 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         true
     }
 
+    /// Builds a failed RDR_to_PC_DataBlock for the current XfrBlock.
+    fn failed_data_block(&self, error: PipeError) -> ExtPacket {
+        let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
+        packet[0] = 0x80; // bMessageType: RDR_to_PC_DataBlock
+        packet[5] = self.slot;
+        packet[6] = self.seq;
+        packet[7] = CCID_CMD_FAIL;
+        packet[8] = error as u8;
+        packet
+    }
+
     /// Resets the reader after a rejected command chain and builds a failed
     /// RDR_to_PC_DataBlock for the current XfrBlock.
     fn reject_chain(&mut self) -> ResponseType {
-        let seq = self.seq;
-        let slot = self.slot;
+        let packet = self.failed_data_block(PipeError::BadLength);
         self.reset_state();
-        let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
-        packet[0] = 0x80; // bMessageType: RDR_to_PC_DataBlock
-        packet[5] = slot;
-        packet[6] = seq;
-        packet[7] = CCID_CMD_FAIL;
-        packet[8] = PipeError::BadLength as u8;
         ResponseType::Internal(packet)
     }
 
     async fn handle_xfer(&mut self, command: XfrBlock) -> Result<ResponseType, ReadError> {
+        if self.discard_app_response {
+            // The application is still finishing an aborted command; its response must be
+            // drained before a new APDU is dispatched.
+            warn!("CCID: XfrBlock while an aborted command is still with the application, rejecting");
+            return Ok(ResponseType::Internal(self.failed_data_block(PipeError::CmdSlotBusy)));
+        }
+
         // Decode once; an unsupported wLevelParameter is Err and must reach the reset paths below.
         let chain = command.chain();
         trace!("Current state: {:?}, command chain: {:?}", self.state, chain.ok());
@@ -1562,19 +1635,25 @@ pub struct Control {
     ccid_descriptor: [u8; CCID_DESC_BLENGTH as usize],
     // Shared with the reader; set on USB bus reset.
     session_reset: Arc<AtomicBool>,
+    // Shared with the reader; carries class-specific ABORT requests.
+    abort_signal: Arc<AbortSignal>,
 }
 
 impl Control {
     /// Creates a new Control handler that reports `ccid_descriptor` for GET_DESCRIPTOR requests.
-    pub fn new(
+    ///
+    /// Crate-private: the handler shares reset and ABORT state with the reader built alongside it.
+    pub(crate) fn new(
         if_num: InterfaceNumber,
         ccid_descriptor: [u8; CCID_DESC_BLENGTH as usize],
         session_reset: Arc<AtomicBool>,
+        abort_signal: Arc<AbortSignal>,
     ) -> Self {
         Control {
             if_num,
             ccid_descriptor,
             session_reset,
+            abort_signal,
         }
     }
 }
@@ -1600,9 +1679,12 @@ impl Handler for Control {
             Ok(request) => match request {
                 ClassRequest::Abort => {
                     // spec: "slot in low, seq in high byte"
-                    // TODO TYLER
                     let [slot, seq] = req.value.to_le_bytes();
-                    //self.pipe.expect_abort(slot, seq);
+                    if slot > CCID_DESC_MAX_SLOT_INDEX {
+                        return Some(OutResponse::Rejected);
+                    }
+                    // The reader completes the abort once the matching bulk ABORT arrives.
+                    self.abort_signal.signal(AbortRequest { slot, seq });
                     Some(OutResponse::Accepted)
                 }
                 _ => Some(OutResponse::Rejected),
