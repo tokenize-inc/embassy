@@ -206,6 +206,7 @@ impl<'d, D: Driver<'d>> Builder<'d, D> {
         #[cfg(feature = "defmt")]
         error!("USB Interfaces: {}", self.interfaces.len());
 
+        #[cfg(feature = "defmt")]
         error!("Config Descriptor: {=[u8]:x}", self.config_descriptor.buf);
         UsbDevice::build(
             self.driver,
