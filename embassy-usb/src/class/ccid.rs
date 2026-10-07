@@ -5,10 +5,10 @@ use alloc::sync::Arc;
 use core::convert::{TryFrom, TryInto};
 use core::mem::MaybeUninit;
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_futures::select::{select3, Either3};
-use embassy_sync::blocking_mutex::raw::{self, CriticalSectionRawMutex};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
 use embassy_sync::signal::Signal;
 use heapless::Vec;
@@ -378,7 +378,6 @@ pub enum ReportId {
 /// State for the CCID reader/writer.
 pub struct State {
     control: MaybeUninit<Control>,
-    in_transfer_offset: AtomicUsize,
 }
 
 impl<'d> Default for State {
@@ -388,11 +387,10 @@ impl<'d> Default for State {
 }
 
 impl State {
-    /// Creates a new `State` with uninitialized control and zeroed transfer offsets.
+    /// Creates a new `State` with an uninitialized control handler.
     pub const fn new() -> Self {
         State {
             control: MaybeUninit::uninit(),
-            in_transfer_offset: AtomicUsize::new(0),
         }
     }
 }
@@ -493,7 +491,10 @@ fn build<'d, D: Driver<'d>>(
     let ccid_descriptor: [u8; CCID_DESC_BLENGTH as usize] = if config.ccid_descriptor.is_empty() {
         DEFAULT_CCID_DESCRIPTOR
     } else {
-        config.ccid_descriptor.try_into().expect("CCID descriptor must be exactly 54 bytes")
+        config
+            .ccid_descriptor
+            .try_into()
+            .expect("CCID descriptor must be exactly 54 bytes")
     };
     assert!(
         ccid_descriptor[0] == CCID_DESC_BLENGTH && ccid_descriptor[1] == CCID_DESC_DESCTYPE_CCID,
@@ -816,11 +817,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 }
                 Either3::Third(request) => {
                     #[cfg(feature = "defmt")]
-                    trace!(
-                        "CCID: Control ABORT for slot {} seq {}",
-                        request.slot,
-                        request.seq
-                    );
+                    trace!("CCID: Control ABORT for slot {} seq {}", request.slot, request.seq);
                     self.control_abort = Some(request);
                     // The bulk half may already have arrived and be waiting for this one.
                     if self.bulk_abort == Some(request) {
@@ -1189,46 +1186,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         packet
     }
 
-    // async fn prime_outbox(&mut self, data: RawPacket) {
-    //     if self.state != CcidReaderState::ReadyToSend && self.state != CcidReaderState::Sending {
-    //         return;
-    //     }
-
-    //     if self.outbox.is_some() {
-    //         error!("Full outbox");
-    //         self.reset_state();
-    //         return;
-    //     }
-
-    //     let chunk_size = core::cmp::min(PACKET_SIZE - CCID_HEADER_LEN, data.len() - self.sent);
-    //     let chunk = &data[self.sent..][..chunk_size];
-    //     self.sent += chunk_size;
-    //     let more = self.sent < data.len();
-
-    //     let chain = match (self.state, more) {
-    //         (CcidReaderState::ReadyToSend, true) => {
-    //             self.state = CcidReaderState::Sending;
-    //             Chain::Begins
-    //         }
-    //         (CcidReaderState::ReadyToSend, false) => {
-    //             self.state = CcidReaderState::Idle;
-    //             Chain::BeginsAndEnds
-    //         }
-    //         (CcidReaderState::Sending, true) => Chain::Continues,
-    //         (CcidReaderState::Sending, false) => {
-    //             self.state = CcidReaderState::Idle;
-    //             Chain::Ends
-    //         }
-    //         // logically impossible
-    //         _ => {
-    //             return;
-    //         }
-    //     };
-
-    //     let primed_packet = DataBlock::new(self.seq, chain, chunk);
-    //     self.outbox = Some(primed_packet.into());
-    // }
-
     /// Appends a command-chain fragment to the APDU being assembled in `outbox`.
     ///
     /// Checks `max_apdu_size` and reserves memory fallibly before growing the buffer, so a host
@@ -1252,7 +1209,10 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         }
         if apdu.try_reserve_exact(fragment.len()).is_err() {
             #[cfg(feature = "defmt")]
-            error!("CCID: Out of memory assembling a {} byte chained APDU", apdu.len() + fragment.len());
+            error!(
+                "CCID: Out of memory assembling a {} byte chained APDU",
+                apdu.len() + fragment.len()
+            );
             return false;
         }
         apdu.extend_from_slice(fragment);
@@ -1721,7 +1681,10 @@ impl<'d, D: Driver<'d>> CcidBulkOut<'d, D> {
                     match read_error {
                         ReadError::BufferOverflow => {
                             #[cfg(feature = "defmt")]
-                            error!("Host sent a packet larger than the endpoint max packet size ({})", max_packet_size);
+                            error!(
+                                "Host sent a packet larger than the endpoint max packet size ({})",
+                                max_packet_size
+                            );
                         }
                         ReadError::Disabled => {
                             #[cfg(feature = "defmt")]
