@@ -42,6 +42,19 @@ pub type RawPacket = heapless::Vec<u8, PACKET_SIZE>;
 /// Application-level packet, which may be larger than a single USB packet and may require chaining.
 pub type ApplicationPacket = Box<[u8]>;
 
+/// A request from the CCID reader to the application.
+///
+/// The application answers every request with an [`ApplicationPacket`] holding the card's
+/// response APDU (data and status word), which the reader returns as RDR_to_PC_DataBlock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CcidRequest {
+    /// A command APDU from PC_to_RDR_XfrBlock, to be sent to the card unchanged.
+    Apdu(ApplicationPacket),
+    /// A PIN verification from PC_to_RDR_Secure. The application obtains the PIN itself, builds the
+    /// VERIFY command with [`PinVerify::build_apdu`] and sends it to the card.
+    VerifyPin(PinVerify),
+}
+
 /// extended packet for commands that exceed the size of a single USB packet, e.g. APDUs with chaining
 pub type ExtPacket = heapless::Vec<u8, MAX_MSG_LENGTH>;
 
@@ -80,7 +93,7 @@ pub enum ResponseType {
     /// Send to the application to handle. Holds a complete APDU, which may be assembled from
     /// several chained CCID messages and so can exceed `MAX_MSG_LENGTH` (bounded by
     /// `Config::max_apdu_size`).
-    External(ApplicationPacket),
+    External(CcidRequest),
     /// No response needed, e.g. for ABORT commands
     None,
 }
@@ -221,7 +234,15 @@ pub const CCID_DESC_CLASS_ENVELOPE: u8 = 0xFF;
 /// wlcdLayout (none)
 pub const CCID_DESC_LCD_LAYOUT: [u8; 2] = [0x00, 0x00];
 /// bPinSupport (0x0 = none, 0x01 = verification, 0x02 = modification)
-pub const CCID_DESC_PIN_SUPPORT: u8 = 0;
+///
+/// Set bit 0 (here or in a custom `Config::ccid_descriptor`) to accept PIN verification with
+/// PC_to_RDR_Secure; the application must then handle [`CcidRequest::VerifyPin`]. While it is
+/// clear, PC_to_RDR_Secure is rejected as unsupported.
+pub const CCID_DESC_PIN_SUPPORT: u8 = 0x00;
+/// Offset of bPinSupport in the CCID class descriptor.
+const CCID_DESC_PIN_SUPPORT_OFFSET: usize = 52;
+/// bPinSupport bit: PIN verification.
+const PIN_SUPPORT_VERIFY: u8 = 0x01;
 /// bMaxCCIDBusySlots
 pub const CCID_DESC_MAX_BUSY_SLOTS: u8 = 1;
 
@@ -311,7 +332,6 @@ pub const DEFAULT_CCID_DESCRIPTOR: [u8; CCID_DESC_BLENGTH as usize] = [
     CCID_DESC_LCD_LAYOUT[0],
     CCID_DESC_LCD_LAYOUT[1],
     // bPinSupport
-    // ICCD: "No PIN pad, not relevant, fixed for legacy reasons"
     CCID_DESC_PIN_SUPPORT,
     // bMaxCCIDBusySlots
     CCID_DESC_MAX_BUSY_SLOTS,
@@ -434,7 +454,7 @@ pub struct CcidReaderWriter<'d, D: Driver<'d>, const READ_N: usize, const WRITE_
 
     protocol_data: ProtocolData,
 
-    ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, ApplicationPacket, WRITE_N>,
+    ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, CcidRequest, WRITE_N>,
 
     slot_status: u8,
 
@@ -466,6 +486,8 @@ pub struct CcidReaderWriter<'d, D: Driver<'d>, const READ_N: usize, const WRITE_
     control_abort: Option<AbortRequest>,
     // Control-pipe ABORT requests, signalled by the control handler.
     abort_signal: Arc<AbortSignal>,
+    // The descriptor advertises PIN verification (bPinSupport bit 0), so PC_to_RDR_Secure is accepted.
+    pin_verify_supported: bool,
     // An ABORT cancelled a command that was already with the application. Its response is
     // dropped when it arrives, and new XfrBlocks are rejected as busy until then, so it can't be
     // mistaken for the response to a later command.
@@ -482,6 +504,7 @@ fn build<'d, D: Driver<'d>>(
     D::EndpointIn,
     Arc<AtomicBool>,
     Arc<AbortSignal>,
+    bool,
 ) {
     let mut func = builder.function(USB_CLASS_CCID, USB_SUBCLASS_NONE, USB_PROTOCOL_NONE);
     let mut iface = func.interface();
@@ -524,7 +547,10 @@ fn build<'d, D: Driver<'d>>(
 
     builder.handler(control);
 
-    (ep_out, ep_in, ep_int_in, session_reset, abort_signal)
+    // PC_to_RDR_Secure is only accepted when the descriptor advertises PIN verification.
+    let pin_verify_supported = ccid_descriptor[CCID_DESC_PIN_SUPPORT_OFFSET] & PIN_SUPPORT_VERIFY != 0;
+
+    (ep_out, ep_in, ep_int_in, session_reset, abort_signal, pin_verify_supported)
 }
 
 impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWriter<'d, D, READ_N, WRITE_N> {
@@ -537,10 +563,11 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         builder: &mut Builder<'d, D>,
         state: &'d mut State,
         config: Config<'d>,
-        ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, ApplicationPacket, WRITE_N>,
+        ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, CcidRequest, WRITE_N>,
     ) -> Self {
         let max_apdu_size = config.max_apdu_size;
-        let (ep_out, ep_in, ep_int_in, session_reset, abort_signal) = build(builder, state, config);
+        let (ep_out, ep_in, ep_int_in, session_reset, abort_signal, pin_verify_supported) =
+            build(builder, state, config);
 
         Self {
             bulk_out: CcidBulkOut { ep_out },
@@ -565,6 +592,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             bulk_abort: None,
             control_abort: None,
             abort_signal,
+            pin_verify_supported,
             discard_app_response: false,
             ccid_to_app,
             protocol_data: ProtocolData::default(),
@@ -791,13 +819,15 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                             warn!("CCID: Failed to write response packet: {:?}", _e);
                         }
                     }
-                    ResponseType::External(packet) => {
+                    ResponseType::External(request) => {
                         #[cfg(feature = "defmt")]
-                        trace!(
-                            "CCID: Received packet from host to send to application: {=[u8]:x}",
-                            &packet
-                        );
-                        self.ccid_to_app.send(packet).await;
+                        match &request {
+                            CcidRequest::Apdu(apdu) => {
+                                trace!("CCID: Received packet from host to send to application: {=[u8]:x}", apdu)
+                            }
+                            CcidRequest::VerifyPin(_) => trace!("CCID: Sending PIN verification request to application"),
+                        }
+                        self.ccid_to_app.send(request).await;
                         #[cfg(feature = "defmt")]
                         trace!("CCID: Sent packet to application");
                     }
@@ -1042,13 +1072,10 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                                 .await,
                         ))
                     }
-                    Command::Secure(_secure) => {
+                    Command::Secure(command) => {
                         #[cfg(feature = "defmt")]
-                        trace!("CCID: Secure command received, data: {=[u8]:x}", _secure);
-                        Ok(ResponseType::Internal(
-                            self.rdr_to_pc_slot_status(CCID_CMD_FAIL, PipeError::CommandNotSupported as u8)
-                                .await,
-                        ))
+                        trace!("CCID: Secure command received, data: {=[u8]:x}", command.data());
+                        Ok(self.handle_secure(command))
                     }
                     Command::Mechanical(_mechanical) => {
                         #[cfg(feature = "defmt")]
@@ -1220,6 +1247,39 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         true
     }
 
+    /// Handles PC_to_RDR_Secure. Only PIN verification is supported: the request is passed to the
+    /// application, which supplies the PIN, and its response is returned like an XfrBlock's.
+    fn handle_secure(&mut self, command: Secure) -> ResponseType {
+        if !self.pin_verify_supported {
+            #[cfg(feature = "defmt")]
+            trace!("CCID: Secure command received but PIN verification is not advertised, rejecting");
+            return ResponseType::Internal(self.failed_data_block(PipeError::CommandNotSupported));
+        }
+        if self.discard_app_response || self.state != CcidReaderState::Idle {
+            #[cfg(feature = "defmt")]
+            warn!("CCID: Secure command while another command is in progress, rejecting");
+            return ResponseType::Internal(self.failed_data_block(PipeError::CmdSlotBusy));
+        }
+        // wLevelParameter: PIN requests split over several messages are not supported.
+        if command[8..10] != [0, 0] {
+            #[cfg(feature = "defmt")]
+            warn!("CCID: Chained Secure command not supported");
+            return ResponseType::Internal(self.failed_data_block(PipeError::CommandNotSupported));
+        }
+        match PinVerify::parse(command.data()) {
+            Ok(verify) => {
+                self.state = CcidReaderState::Processing;
+                self.pending_seq = Some(self.seq);
+                ResponseType::External(CcidRequest::VerifyPin(verify))
+            }
+            Err(_e) => {
+                #[cfg(feature = "defmt")]
+                warn!("CCID: Unsupported PIN request: {:?}", _e);
+                ResponseType::Internal(self.failed_data_block(PipeError::CommandNotSupported))
+            }
+        }
+    }
+
     /// Builds a failed RDR_to_PC_DataBlock for the current XfrBlock.
     fn failed_data_block(&self, error: PipeError) -> ExtPacket {
         let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
@@ -1261,7 +1321,9 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     self.state = CcidReaderState::Processing;
                     self.pending_seq = Some(self.seq);
 
-                    Ok(ResponseType::External(command.data().to_vec().into_boxed_slice()))
+                    Ok(ResponseType::External(CcidRequest::Apdu(
+                        command.data().to_vec().into_boxed_slice(),
+                    )))
                 }
                 Ok(Chain::Begins) => {
                     #[cfg(feature = "defmt")]
@@ -1323,7 +1385,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         self.state = CcidReaderState::Processing;
                         self.pending_seq = Some(self.seq);
 
-                        Ok(ResponseType::External(full_message))
+                        Ok(ResponseType::External(CcidRequest::Apdu(full_message)))
                     } else {
                         #[cfg(feature = "defmt")]
                         error!("Received chained packet but outbox is None");
@@ -1810,6 +1872,197 @@ impl Handler for Control {
     }
 }
 
+// PIN VERIFICATION (PC_to_RDR_Secure)
+
+/// bPINOperation: PIN verification.
+const PIN_OPERATION_VERIFY: u8 = 0x00;
+/// Offset of abPINApdu in the PIN verification data structure that follows bPINOperation.
+const PIN_VERIFY_APDU_OFFSET: usize = 14;
+/// ISO 7816-4 VERIFY. The PIN is only ever inserted into this command, so a host cannot have the
+/// reader place the PIN into a command that would write or reveal it.
+const INS_VERIFY: u8 = 0x20;
+/// CLA, INS, P1, P2, Lc.
+const APDU_HEADER_LEN: usize = 5;
+/// bmFormatString PIN type: BCD.
+const PIN_TYPE_BCD: u8 = 0b01;
+/// bmFormatString PIN type: ASCII.
+const PIN_TYPE_ASCII: u8 = 0b10;
+
+/// Why a PIN verification request or PIN could not be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum PinVerifyError {
+    /// Not a PIN verification, or a PIN format this reader does not support.
+    Unsupported,
+    /// Inconsistent lengths, or a PIN or length field that lies outside the APDU data.
+    Malformed,
+    /// The APDU template is not an ISO 7816-4 VERIFY command.
+    NotVerifyCommand,
+    /// The PIN is empty, contains non-digits, is outside the requested length range, or does not
+    /// fit the PIN block.
+    InvalidPin,
+}
+
+/// A PIN verification requested by the host with PC_to_RDR_Secure.
+///
+/// Instead of the host prompting for the PIN, the reader obtains it and inserts it into the host's
+/// VERIFY template as described by the CCID PIN verification data structure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinVerify {
+    /// bTimeOut: seconds to wait for PIN entry; 0 means the reader's default.
+    pub timeout_s: u8,
+    format_string: u8,
+    pin_block_string: u8,
+    pin_length_format: u8,
+    min_pin_len: u8,
+    max_pin_len: u8,
+    apdu_template: Box<[u8]>,
+}
+
+impl PinVerify {
+    /// Parses abData of PC_to_RDR_Secure, starting at bPINOperation.
+    fn parse(data: &[u8]) -> Result<Self, PinVerifyError> {
+        let (&operation, structure) = data.split_first().ok_or(PinVerifyError::Malformed)?;
+        if operation != PIN_OPERATION_VERIFY {
+            return Err(PinVerifyError::Unsupported);
+        }
+        if structure.len() < PIN_VERIFY_APDU_OFFSET + APDU_HEADER_LEN {
+            return Err(PinVerifyError::Malformed);
+        }
+        // Remaining fields (bEntryValidationCondition, bNumberMessage, wLangId, bMsgIndex,
+        // bTeoPrologue) concern PIN-pad prompts and TPDU readers and are not needed here.
+        let verify = PinVerify {
+            timeout_s: structure[0],
+            format_string: structure[1],
+            pin_block_string: structure[2],
+            pin_length_format: structure[3],
+            // wPINMaxExtraDigit = 0xXXYY (little-endian): XX = minimum, YY = maximum digits.
+            max_pin_len: structure[4],
+            min_pin_len: structure[5],
+            apdu_template: structure[PIN_VERIFY_APDU_OFFSET..].into(),
+        };
+        verify.validate()?;
+        Ok(verify)
+    }
+
+    fn validate(&self) -> Result<(), PinVerifyError> {
+        if self.apdu_template[1] != INS_VERIFY {
+            return Err(PinVerifyError::NotVerifyCommand);
+        }
+        let data_bits = self.data_len()? * 8;
+        if !matches!(self.pin_type(), PIN_TYPE_BCD | PIN_TYPE_ASCII) {
+            return Err(PinVerifyError::Unsupported);
+        }
+        if self.pin_offset_bits() + self.pin_block_bits().unwrap_or(0) > data_bits {
+            return Err(PinVerifyError::Malformed);
+        }
+        let length_bits = self.length_field_bits();
+        if length_bits > 8 || (length_bits > 0 && self.length_offset_bits() + length_bits > data_bits) {
+            return Err(PinVerifyError::Unsupported);
+        }
+        Ok(())
+    }
+
+    /// Builds the VERIFY command APDU with `pin` (ASCII digits) inserted into the host's template.
+    pub fn build_apdu(&self, pin: &[u8]) -> Result<ApplicationPacket, PinVerifyError> {
+        let digits = pin.len();
+        if digits == 0
+            || !pin.iter().all(u8::is_ascii_digit)
+            || (self.min_pin_len != 0 && digits < usize::from(self.min_pin_len))
+            || (self.max_pin_len != 0 && digits > usize::from(self.max_pin_len))
+        {
+            return Err(PinVerifyError::InvalidPin);
+        }
+
+        let digit_bits = if self.pin_type() == PIN_TYPE_ASCII { 8 } else { 4 };
+        let pin_bits = digits * digit_bits;
+        let data_bits = self.data_len()? * 8;
+        let block_bits = self.pin_block_bits().unwrap_or(pin_bits);
+        let length_bits = self.length_field_bits();
+        if pin_bits > block_bits
+            || self.pin_offset_bits() + block_bits > data_bits
+            || (length_bits > 0 && digits >= 1 << length_bits)
+        {
+            return Err(PinVerifyError::InvalidPin);
+        }
+
+        let mut apdu = self.apdu_template.to_vec();
+        let data = &mut apdu[APDU_HEADER_LEN..];
+        // Bit 2 of bmFormatString: right justification within the PIN block.
+        let right_justified = self.format_string & 0x04 != 0;
+        let start = self.pin_offset_bits() + if right_justified { block_bits - pin_bits } else { 0 };
+        for (i, digit) in pin.iter().enumerate() {
+            let value = if self.pin_type() == PIN_TYPE_ASCII {
+                *digit
+            } else {
+                digit - b'0'
+            };
+            write_bits(data, start + i * digit_bits, digit_bits, value);
+        }
+        if length_bits > 0 {
+            write_bits(data, self.length_offset_bits(), length_bits, digits as u8);
+        }
+        Ok(apdu.into_boxed_slice())
+    }
+
+    /// Lc of the template, checked against the template length.
+    fn data_len(&self) -> Result<usize, PinVerifyError> {
+        let lc = usize::from(self.apdu_template[4]);
+        if self.apdu_template.len() < APDU_HEADER_LEN + lc {
+            return Err(PinVerifyError::Malformed);
+        }
+        Ok(lc)
+    }
+
+    fn pin_type(&self) -> u8 {
+        self.format_string & 0x03
+    }
+
+    /// bmFormatString bits 6..3: PIN position in the APDU data, in bytes (bit 7 set) or bits.
+    fn pin_offset_bits(&self) -> usize {
+        let position = usize::from((self.format_string >> 3) & 0x0F);
+        if self.format_string & 0x80 != 0 {
+            position * 8
+        } else {
+            position
+        }
+    }
+
+    /// bmPINBlockString bits 3..0: PIN block size in bytes; 0 means just the PIN digits.
+    fn pin_block_bits(&self) -> Option<usize> {
+        match usize::from(self.pin_block_string & 0x0F) {
+            0 => None,
+            bytes => Some(bytes * 8),
+        }
+    }
+
+    /// bmPINBlockString bits 7..4: size of the PIN length field in bits; 0 means no length field.
+    fn length_field_bits(&self) -> usize {
+        usize::from(self.pin_block_string >> 4)
+    }
+
+    /// bmPINLengthFormat bits 3..0: length field position in the APDU data, in bytes (bit 4 set) or bits.
+    fn length_offset_bits(&self) -> usize {
+        let position = usize::from(self.pin_length_format & 0x0F);
+        if self.pin_length_format & 0x10 != 0 {
+            position * 8
+        } else {
+            position
+        }
+    }
+}
+
+/// Writes the low `bits` bits of `value` into `buf`, most significant bit first, starting at
+/// `bit_offset` from the start of `buf`.
+fn write_bits(buf: &mut [u8], bit_offset: usize, bits: usize, value: u8) {
+    for i in 0..bits {
+        let bit = (value >> (bits - 1 - i)) & 1;
+        let position = bit_offset + i;
+        let shift = 7 - position % 8;
+        buf[position / 8] = (buf[position / 8] & !(1 << shift)) | (bit << shift);
+    }
+}
+
 // PACKET
 
 /// RawPacket is a wrapper around a heapless::Vec<u8, N> that represents a CCID packet. It provides methods for parsing the CCID header and data.
@@ -2176,6 +2429,7 @@ command_message!(
 );
 
 impl PacketWithData for XfrBlock {}
+impl PacketWithData for Secure {}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u8)]
