@@ -373,9 +373,8 @@ impl<'d, D: Driver<'d>> UsbDevice<'d, D> {
                 for (first, last, chunk) in first_last(chunks) {
                     match self.control.data_in(chunk, first, last).await {
                         Ok(()) => {}
-                        Err(_e) => {
-                            #[cfg(feature = "defmt")]
-                            warn!("control accept_in failed: {:?}", _e);
+                        Err(e) => {
+                            warn!("control accept_in failed: {:?}", e);
                             return;
                         }
                     }
@@ -391,7 +390,6 @@ impl<'d, D: Driver<'d>> UsbDevice<'d, D> {
         let mut total = 0;
 
         if req_length > self.control_buf.len() {
-            #[cfg(feature = "defmt")]
             warn!(
                 "got CONTROL OUT with length {} higher than the control_buf len {}, rejecting.",
                 req_length,
@@ -405,9 +403,8 @@ impl<'d, D: Driver<'d>> UsbDevice<'d, D> {
         for (first, last, chunk) in first_last(chunks) {
             let size = match self.control.data_out(chunk, first, last).await {
                 Ok(x) => x,
-                Err(_e) => {
-                    #[cfg(feature = "defmt")]
-                    warn!("usb: failed to read CONTROL OUT data stage: {:?}", _e);
+                Err(e) => {
+                    warn!("usb: failed to read CONTROL OUT data stage: {:?}", e);
                     return;
                 }
             };

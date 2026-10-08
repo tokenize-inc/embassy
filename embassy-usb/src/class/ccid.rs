@@ -550,7 +550,14 @@ fn build<'d, D: Driver<'d>>(
     // PC_to_RDR_Secure is only accepted when the descriptor advertises PIN verification.
     let pin_verify_supported = ccid_descriptor[CCID_DESC_PIN_SUPPORT_OFFSET] & PIN_SUPPORT_VERIFY != 0;
 
-    (ep_out, ep_in, ep_int_in, session_reset, abort_signal, pin_verify_supported)
+    (
+        ep_out,
+        ep_in,
+        ep_int_in,
+        session_reset,
+        abort_signal,
+        pin_verify_supported,
+    )
 }
 
 impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWriter<'d, D, READ_N, WRITE_N> {
@@ -664,7 +671,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         }
         atr.push(tck).ok();
 
-        #[cfg(feature = "defmt")]
         trace!("CCID: Constructed ATR: {=[u8]:x}", &atr);
 
         atr
@@ -691,7 +697,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
     /// Writes an interrupt report to the host, notifying it of a slot change or other event.
     pub async fn write_interrupt(&mut self, status_code: bool) -> Result<(), EndpointError> {
         let data = self.rdr_to_pc_notify_slot_change(status_code).await;
-        #[cfg(feature = "defmt")]
         trace!("CCID: Sending interrupt report to host: {=[u8]:x}", &data);
         self.int_in.write(&data).await
     }
@@ -702,13 +707,11 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<ResponseType, ReadError> {
         match self.bulk_out.read(buf).await {
             Ok(len) => {
-                #[cfg(feature = "defmt")]
                 trace!("CCID: Received packet from host: {=[u8]:x}", &buf);
                 self.handle_packet(RawPacket::from_slice(&buf[..len]).map_err(|_| ReadError::BufferOverflow)?)
                     .await
             }
             Err(e) => {
-                #[cfg(feature = "defmt")]
                 warn!("CCID: Failed to read packet from host: {:?}", e);
                 Err(e)
             }
@@ -725,7 +728,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         self.ready().await;
 
         if let Err(_e) = self.write_interrupt(true).await {
-            #[cfg(feature = "defmt")]
             error!("CCID: Failed to write initial interrupt report to host: {:?}", _e);
         }
 
@@ -740,7 +742,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 Either3::First(raw_packet) => {
                     if self.session_reset.swap(false, Ordering::AcqRel) {
                         // This answers a command from the previous session; the host won't expect it.
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: Dropping application response from before USB reset");
                         drop(raw_packet);
                         self.reset_session(app_to_ccid);
@@ -748,13 +749,11 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     }
                     if self.discard_app_response {
                         // This answers a command the host has aborted.
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: Dropping application response to aborted command");
                         self.discard_app_response = false;
                         continue;
                     }
 
-                    #[cfg(feature = "defmt")]
                     trace!(
                         "CCID: Received packet from application to send to host: {=[u8]:x}",
                         &raw_packet
@@ -765,7 +764,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     let response_seq = match self.pending_seq.take() {
                         Some(seq) => seq,
                         None => {
-                            #[cfg(feature = "defmt")]
                             warn!("CCID: Application response without a pending XfrBlock");
                             self.seq
                         }
@@ -773,18 +771,15 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
 
                     // If packet is larger than the max usb size we need to split in into chunks and send with correct chaining
                     if raw_packet.len() > PACKET_SIZE - CCID_HEADER_LEN {
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: Packet larger than max USB packet size, splitting into chunks with chaining");
 
                         let max_chunk = PACKET_SIZE - CCID_HEADER_LEN;
                         let chunk = raw_packet[..max_chunk].to_vec();
 
                         let data: ExtPacket = DataBlock::new(response_seq, Chain::Begins, &chunk).into();
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: Sending Chained response packet to host: {=[u8]:x}", &data);
 
                         if let Err(_e) = self.write(&data).await {
-                            #[cfg(feature = "defmt")]
                             warn!("CCID: Failed to write Chained response packet: {:?}", _e);
                         }
 
@@ -792,15 +787,12 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         self.sent = chunk.len();
                         self.outbox = Some(raw_packet);
                     } else {
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: Packet fits in single USB packet, sending with beginsAndEnds");
                         // Wrap in a PRDR_to_PC_DataBlock response and send to host
                         let data: ExtPacket = DataBlock::new(response_seq, Chain::BeginsAndEnds, &raw_packet).into();
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: Sending response packet to host: {=[u8]:x}", &data);
 
                         if let Err(_e) = self.write(&data).await {
-                            #[cfg(feature = "defmt")]
                             warn!("CCID: Failed to write response packet: {:?}", _e);
                         }
                         self.state = CcidReaderState::Idle;
@@ -808,36 +800,35 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 }
                 Either3::Second(Ok(response_type)) => match response_type {
                     ResponseType::Internal(packet) => {
-                        #[cfg(feature = "defmt")]
                         trace!(
                             "CCID: Received packet from host to send back to host: {=[u8]:x}",
                             &packet
                         );
 
                         if let Err(_e) = self.write(&packet).await {
-                            #[cfg(feature = "defmt")]
                             warn!("CCID: Failed to write response packet: {:?}", _e);
                         }
                     }
                     ResponseType::External(request) => {
-                        #[cfg(feature = "defmt")]
                         match &request {
                             CcidRequest::Apdu(apdu) => {
-                                trace!("CCID: Received packet from host to send to application: {=[u8]:x}", apdu)
+                                trace!(
+                                    "CCID: Received packet from host to send to application: {=[u8]:x}",
+                                    apdu
+                                )
                             }
-                            CcidRequest::VerifyPin(_) => trace!("CCID: Sending PIN verification request to application"),
+                            CcidRequest::VerifyPin(_) => {
+                                trace!("CCID: Sending PIN verification request to application")
+                            }
                         }
                         self.ccid_to_app.send(request).await;
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: Sent packet to application");
                     }
                     ResponseType::None => {
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: Nothing to handle");
                     }
                 },
                 Either3::Second(Err(e)) => {
-                    #[cfg(feature = "defmt")]
                     warn!("CCID: Failed to read packet from host: {:?}", e);
                     // Disabled means the endpoint went away (bus reset or deconfiguration), which
                     // ends the session even if no reset was signalled.
@@ -846,14 +837,12 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     }
                 }
                 Either3::Third(request) => {
-                    #[cfg(feature = "defmt")]
                     trace!("CCID: Control ABORT for slot {} seq {}", request.slot, request.seq);
                     self.control_abort = Some(request);
                     // The bulk half may already have arrived and be waiting for this one.
                     if self.bulk_abort == Some(request) {
                         let packet = self.abort(request);
                         if let Err(_e) = self.write(&packet).await {
-                            #[cfg(feature = "defmt")]
                             warn!("CCID: Failed to write ABORT response: {:?}", _e);
                         }
                     }
@@ -874,7 +863,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         // only (can we fix this), so 255B is the maximum)
         if !self.receiving_long {
             if packet.len() < CCID_HEADER_LEN {
-                #[cfg(feature = "defmt")]
                 error!("CCID: unexpected short packet");
                 self.reset_state();
                 return Ok(ResponseType::None);
@@ -889,7 +877,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             let pl = packet.data_len();
             let message_len = CCID_HEADER_LEN.saturating_add(pl);
             if message_len > self.ext_packet.capacity() {
-                #[cfg(feature = "defmt")]
                 error!(
                     "CCID: Message length {} exceeds the maximum of {}",
                     message_len,
@@ -903,7 +890,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 self.in_chain = 1;
                 self.long_packet_missing = message_len - packet.len();
                 self.packet_len = pl;
-                #[cfg(feature = "defmt")]
                 trace!(
                     "CCID: Received first packet of long message, pl {}, missing {}, in_chain {}",
                     pl,
@@ -914,7 +900,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             }
         } else {
             if self.ext_packet.extend_from_slice(&packet).is_err() {
-                #[cfg(feature = "defmt")]
                 error!(
                     "CCID: Extended packet got larger than maximum size ({}), wants {}",
                     self.ext_packet.capacity(),
@@ -925,7 +910,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             }
             self.in_chain += 1;
             if packet.len() > self.long_packet_missing {
-                #[cfg(feature = "defmt")]
                 error!("CCID: Got larger packet than expected");
                 self.long_packet_missing = 0;
             } else {
@@ -935,7 +919,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 return Ok(ResponseType::None);
             }
 
-            #[cfg(feature = "defmt")]
             trace!(
                 "CCID: pl {}, p {}, missing {}, in_chain {}",
                 self.packet_len,
@@ -947,7 +930,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             self.receiving_long = false;
         }
 
-        #[cfg(feature = "defmt")]
         trace!("CCID: Received full packet: {=[u8]:x}", &self.ext_packet);
         match Command::try_from(self.ext_packet.clone()) {
             Ok(command) => {
@@ -965,7 +947,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     if self.control_abort == Some(request) {
                         return Ok(ResponseType::Internal(self.abort(request)));
                     }
-                    #[cfg(feature = "defmt")]
                     trace!(
                         "CCID: Bulk ABORT for slot {} seq {}, waiting for control ABORT",
                         request.slot,
@@ -977,7 +958,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 // Once the control pipe has announced an ABORT, reject all other commands until
                 // the matching bulk ABORT arrives.
                 if let Some(_control_abort) = self.control_abort {
-                    #[cfg(feature = "defmt")]
                     trace!(
                         "CCID: Received command while waiting for bulk abort with seq {}, rejecting",
                         _control_abort.seq
@@ -995,7 +975,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 match command {
                     Command::IccPowerOn(_command) => {
                         self.slot_status = 0x00; // An ICC is present and active
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: IccPowerOn command received, sending ATR response");
                         let atr = self.atr.clone();
                         Ok(ResponseType::Internal(
@@ -1003,7 +982,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         ))
                     }
                     Command::IccPowerOff(_command) => {
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: IccPowerOff command received");
                         self.slot_status = 0x01; // An ICC is present and inactive
                         Ok(ResponseType::Internal(
@@ -1011,26 +989,22 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         ))
                     }
                     Command::GetSlotStatus(_command) => {
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: GetSlotStatus command received");
                         Ok(ResponseType::Internal(
                             self.rdr_to_pc_slot_status(self.slot_status, 0x00).await,
                         ))
                     }
                     Command::XfrBlock(command) => {
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: XfrBlock command received, data: {=[u8]:x}", command.data());
                         self.handle_xfer(command).await
                     }
                     // Handled above, before the abort-pending check.
                     Command::Abort(_command) => Ok(ResponseType::None),
                     Command::GetParameters(_command) => {
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: GetParameters command received");
                         Ok(ResponseType::Internal(self.rdr_to_pc_parameters(0x0, 0x0).await))
                     }
                     Command::ResetParameters(_reset_parameters) => {
-                        #[cfg(feature = "defmt")]
                         trace!(
                             "CCID: ResetParameters command received, data: {=[u8]:x}",
                             _reset_parameters
@@ -1041,7 +1015,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         ))
                     }
                     Command::SetParameters(_set_parameters) => {
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: SetParameters command received, data: {=[u8]:x}", _set_parameters);
                         Ok(ResponseType::Internal(
                             self.rdr_to_pc_parameters(CCID_CMD_FAIL, PipeError::CommandNotSupported as u8)
@@ -1049,7 +1022,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         ))
                     }
                     Command::Escape(_escape) => {
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: Escape command received, data: {=[u8]:x}", _escape);
                         Ok(ResponseType::Internal(
                             self.rdr_to_pc_escape(CCID_CMD_FAIL, PipeError::CommandNotSupported as u8, &[0x00; 4])
@@ -1057,7 +1029,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         ))
                     }
                     Command::IccClock(_icc_clock) => {
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: IccClock command received, data: {=[u8]:x}", _icc_clock);
                         Ok(ResponseType::Internal(
                             self.rdr_to_pc_slot_status(CCID_CMD_FAIL, PipeError::CommandNotSupported as u8)
@@ -1065,7 +1036,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         ))
                     }
                     Command::T0APDU(_t0_apdu) => {
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: T0APDU command received, data: {=[u8]:x}", _t0_apdu);
                         Ok(ResponseType::Internal(
                             self.rdr_to_pc_slot_status(CCID_CMD_FAIL, PipeError::CommandNotSupported as u8)
@@ -1073,12 +1043,10 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         ))
                     }
                     Command::Secure(command) => {
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: Secure command received, data: {=[u8]:x}", command.data());
                         Ok(self.handle_secure(command))
                     }
                     Command::Mechanical(_mechanical) => {
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: Mechanical command received, data: {=[u8]:x}", _mechanical);
                         Ok(ResponseType::Internal(
                             self.rdr_to_pc_slot_status(CCID_CMD_FAIL, PipeError::CommandNotSupported as u8)
@@ -1086,7 +1054,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         ))
                     }
                     Command::SetDataRateAndClockFrequency(_set_data_rate_and_clock_frequency) => {
-                        #[cfg(feature = "defmt")]
                         trace!(
                             "CCID: SetDataRateAndClockFrequency command received, data: {=[u8]:x}",
                             _set_data_rate_and_clock_frequency
@@ -1102,7 +1069,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 }
             }
             Err(PacketError::ShortPacket) => {
-                #[cfg(feature = "defmt")]
                 error!("CCID: Unexpectedly short packet");
                 self.reset_state();
                 let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
@@ -1113,7 +1079,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 Ok(ResponseType::Internal(packet))
             }
             Err(PacketError::UnknownCommand(_p)) => {
-                #[cfg(feature = "defmt")]
                 info!("CCID: Unknown command {:?}", &_p);
                 self.seq = self.ext_packet[6];
                 let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
@@ -1124,7 +1089,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 Ok(ResponseType::Internal(packet))
             }
             Err(PacketError::TruncatedPayload) => {
-                #[cfg(feature = "defmt")]
                 error!("CCID: dwLength exceeds the received payload, rejecting command");
                 let seq = self.ext_packet[6];
                 let slot = self.ext_packet[5];
@@ -1138,7 +1102,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 Ok(ResponseType::Internal(packet))
             }
             Err(PacketError::WrongSlot(slot)) => {
-                #[cfg(feature = "defmt")]
                 warn!("CCID: Command for nonexistent slot {}", slot);
                 let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
                 packet[0] = 0x81; // bMessageType: RDR_to_PC_SlotStatus
@@ -1166,7 +1129,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         while app_to_ccid.try_receive().is_ok() {
             _dropped += 1;
         }
-        #[cfg(feature = "defmt")]
         trace!(
             "CCID: USB session reset, _dropped {} queued application response(s)",
             _dropped
@@ -1194,7 +1156,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
     // Completes an ABORT. Only call this once matching ABORT requests have arrived on both the
     // control pipe and the bulk endpoint.
     fn abort(&mut self, request: AbortRequest) -> ExtPacket {
-        #[cfg(feature = "defmt")]
         trace!("CCID: Aborting slot {} seq {}", request.slot, request.seq);
         // A command that is already with the application can't be recalled; drop its response
         // when it arrives instead of sending it.
@@ -1225,7 +1186,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             .checked_add(fragment.len())
             .is_some_and(|len| len <= self.max_apdu_size);
         if !fits {
-            #[cfg(feature = "defmt")]
             error!(
                 "CCID: Chained APDU exceeds the maximum of {} bytes ({} + {})",
                 self.max_apdu_size,
@@ -1235,7 +1195,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             return false;
         }
         if apdu.try_reserve_exact(fragment.len()).is_err() {
-            #[cfg(feature = "defmt")]
             error!(
                 "CCID: Out of memory assembling a {} byte chained APDU",
                 apdu.len() + fragment.len()
@@ -1251,18 +1210,15 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
     /// application, which supplies the PIN, and its response is returned like an XfrBlock's.
     fn handle_secure(&mut self, command: Secure) -> ResponseType {
         if !self.pin_verify_supported {
-            #[cfg(feature = "defmt")]
             trace!("CCID: Secure command received but PIN verification is not advertised, rejecting");
             return ResponseType::Internal(self.failed_data_block(PipeError::CommandNotSupported));
         }
         if self.discard_app_response || self.state != CcidReaderState::Idle {
-            #[cfg(feature = "defmt")]
             warn!("CCID: Secure command while another command is in progress, rejecting");
             return ResponseType::Internal(self.failed_data_block(PipeError::CmdSlotBusy));
         }
         // wLevelParameter: PIN requests split over several messages are not supported.
         if command[8..10] != [0, 0] {
-            #[cfg(feature = "defmt")]
             warn!("CCID: Chained Secure command not supported");
             return ResponseType::Internal(self.failed_data_block(PipeError::CommandNotSupported));
         }
@@ -1273,7 +1229,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 ResponseType::External(CcidRequest::VerifyPin(verify))
             }
             Err(_e) => {
-                #[cfg(feature = "defmt")]
                 warn!("CCID: Unsupported PIN request: {:?}", _e);
                 ResponseType::Internal(self.failed_data_block(PipeError::CommandNotSupported))
             }
@@ -1303,20 +1258,17 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         if self.discard_app_response {
             // The application is still finishing an aborted command; its response must be
             // drained before a new APDU is dispatched.
-            #[cfg(feature = "defmt")]
             warn!("CCID: XfrBlock while an aborted command is still with the application, rejecting");
             return Ok(ResponseType::Internal(self.failed_data_block(PipeError::CmdSlotBusy)));
         }
 
         // Decode once; an unsupported wLevelParameter is Err and must reach the reset paths below.
         let chain = command.chain();
-        #[cfg(feature = "defmt")]
         trace!("Current state: {:?}, command chain: {:?}", self.state, chain.ok());
 
         match self.state {
             CcidReaderState::Idle => match chain {
                 Ok(Chain::BeginsAndEnds) => {
-                    #[cfg(feature = "defmt")]
                     trace!("CCID: Received XfrBlock with no chaining, processing immediately");
                     self.state = CcidReaderState::Processing;
                     self.pending_seq = Some(self.seq);
@@ -1326,7 +1278,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     )))
                 }
                 Ok(Chain::Begins) => {
-                    #[cfg(feature = "defmt")]
                     trace!("CCID: Received XfrBlock with chaining, waiting for more packets");
 
                     // The fragment can carry up to MAX_MSG_LENGTH - CCID_HEADER_LEN bytes, so it is
@@ -1341,13 +1292,11 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     ))
                 }
                 Err(_) => {
-                    #[cfg(feature = "defmt")]
                     error!("Unknown chain");
                     self.reset_state();
                     Ok(ResponseType::None)
                 }
                 _ => {
-                    #[cfg(feature = "defmt")]
                     error!("unexpectedly in idle state");
                     self.reset_state();
                     Ok(ResponseType::None)
@@ -1355,11 +1304,9 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             },
             CcidReaderState::Receiving => match chain {
                 Ok(Chain::Continues) => {
-                    #[cfg(feature = "defmt")]
                     trace!("CCID: Received XfrBlock with chaining, waiting for more packets");
 
                     if self.outbox.is_none() {
-                        #[cfg(feature = "defmt")]
                         error!("Received chained packet but outbox is None");
                         self.reset_state();
                         return Ok(ResponseType::None);
@@ -1373,7 +1320,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     ))
                 }
                 Ok(Chain::Ends) => {
-                    #[cfg(feature = "defmt")]
                     trace!("CCID: Received last XfrBlock in chain, processing full message");
 
                     if self.outbox.is_some() {
@@ -1387,41 +1333,35 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
 
                         Ok(ResponseType::External(CcidRequest::Apdu(full_message)))
                     } else {
-                        #[cfg(feature = "defmt")]
                         error!("Received chained packet but outbox is None");
                         self.reset_state();
                         Ok(ResponseType::None)
                     }
                 }
                 Err(_) => {
-                    #[cfg(feature = "defmt")]
                     error!("Unknown chain");
                     self.reset_state();
                     Ok(ResponseType::None)
                 }
                 _ => {
-                    #[cfg(feature = "defmt")]
                     error!("unexpectedly in idle state");
                     self.reset_state();
                     Ok(ResponseType::None)
                 }
             },
             CcidReaderState::Processing | CcidReaderState::ReadyToSend => {
-                #[cfg(feature = "defmt")]
                 error!("Received XfrBlock while already processing another, rejecting");
                 self.reset_state();
                 Ok(ResponseType::None)
             }
             CcidReaderState::Sending => match chain {
                 Ok(Chain::ExpectingMore) => {
-                    #[cfg(feature = "defmt")]
                     trace!(
                         "CCID: Received XfrBlock while sending, expecting more packets: Sent {} bytes so far",
                         self.sent
                     );
                     // get next block f outbox and prime it for sending
                     if let Some(outbox) = &self.outbox {
-                        #[cfg(feature = "defmt")]
                         trace!(
                             "CCID: Outbox has {} bytes, sent {}, remaining {}",
                             outbox.len(),
@@ -1434,7 +1374,6 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         let has_more = self.sent < outbox.len();
                         let chain = if has_more { Chain::Continues } else { Chain::Ends };
                         let data = self.rdr_to_pc_data_block(&chunk.to_vec(), chain).await;
-                        #[cfg(feature = "defmt")]
                         trace!("CCID: Sending chained response packet to host: {=[u8]:x}", &data);
                         if chain == Chain::Ends {
                             self.reset_state();
@@ -1443,14 +1382,12 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                             ExtPacket::from_slice(&data).map_err(|_| ReadError::BufferOverflow)?,
                         ))
                     } else {
-                        #[cfg(feature = "defmt")]
                         error!("Received chained packet but outbox is None");
                         self.reset_state();
                         Ok(ResponseType::None)
                     }
                 }
                 _chain => {
-                    #[cfg(feature = "defmt")]
                     error!("unexpectedly in receiving state and got chain");
                     self.reset_state();
                     Ok(ResponseType::None)
@@ -1658,7 +1595,6 @@ impl<'d, D: Driver<'d>> CcidIntIn<'d, D> {
         let max_packet_size = usize::from(self.ep_int_in.info().max_packet_size);
         let zlp_needed = report.len() < PACKET_SIZE && (report.len() % max_packet_size == 0);
         for chunk in report.chunks(max_packet_size) {
-            #[cfg(feature = "defmt")]
             trace!(
                 "CCID: Writing interrupt chunk to host: {=[u8]:x}, {}",
                 chunk,
@@ -1668,7 +1604,6 @@ impl<'d, D: Driver<'d>> CcidIntIn<'d, D> {
         }
 
         if zlp_needed {
-            #[cfg(feature = "defmt")]
             trace!("CCID: Writing ZLP to host");
             self.ep_int_in.write(&[]).await?;
         }
@@ -1685,25 +1620,20 @@ impl<'d, D: Driver<'d>> CcidBulkIn<'d, D> {
 
     /// Writes `report` to its interrupt endpoint.
     pub async fn write(&mut self, report: &[u8]) -> Result<(), EndpointError> {
-        #[cfg(feature = "defmt")]
         trace!("CCID: Writing report to host: {=[u8]:x}, {}", report, report.len());
         assert!(report.len() <= MAX_MSG_LENGTH);
 
         let max_packet_size = usize::from(self.ep_in.info().max_packet_size);
-        #[cfg(feature = "defmt")]
         trace!("CCID: Endpoint max packet size: {}", max_packet_size);
         // A transfer that ends on a full packet must be terminated with a ZLP, otherwise a host
         // read sized for a longer message (up to dwMaxCCIDMessageLength) keeps waiting for data.
         let zlp_needed = !report.is_empty() && report.len() % max_packet_size == 0;
         for chunk in report.chunks(max_packet_size) {
-            #[cfg(feature = "defmt")]
             trace!("CCID: Writing chunk to host: {=[u8]:x}, {}", chunk, chunk.len());
             self.ep_in.write(chunk).await?;
         }
-        #[cfg(feature = "defmt")]
         trace!("CCID: Finished writing report to host");
         if zlp_needed {
-            #[cfg(feature = "defmt")]
             trace!("CCID: Writing ZLP to host");
             self.ep_in.write(&[]).await?;
         }
@@ -1732,9 +1662,7 @@ impl<'d, D: Driver<'d>> CcidBulkOut<'d, D> {
             match self.ep_out.read(&mut buf[..max_packet_size]).await {
                 Ok(0) => continue,
                 Ok(size) => {
-                    #[cfg(feature = "defmt")]
                     trace!("CCID Read packet of size {} from host", size);
-                    #[cfg(feature = "defmt")]
                     trace!("CCID Read packet: {=[u8]:x}", &buf[..size]);
                     return Ok(size);
                 }
@@ -1742,14 +1670,12 @@ impl<'d, D: Driver<'d>> CcidBulkOut<'d, D> {
                     let read_error: ReadError = err.into();
                     match read_error {
                         ReadError::BufferOverflow => {
-                            #[cfg(feature = "defmt")]
                             error!(
                                 "Host sent a packet larger than the endpoint max packet size ({})",
                                 max_packet_size
                             );
                         }
                         ReadError::Disabled => {
-                            #[cfg(feature = "defmt")]
                             warn!("Endpoint was disabled while reading");
                             self.ready().await;
                         }
@@ -1793,7 +1719,6 @@ impl Control {
 
 impl Handler for Control {
     fn reset(&mut self) {
-        #[cfg(feature = "defmt")]
         trace!("CCID reset");
         self.session_reset.store(true, Ordering::Release);
     }
@@ -1807,7 +1732,6 @@ impl Handler for Control {
 
         // This uses a defmt-specific formatter that causes use of the `log`
         // feature to fail to build, so leave it defmt-specific for now.
-        #[cfg(feature = "defmt")]
         trace!("CCID control_out {:?} {=[u8]:x}", req, _data);
         match ClassRequest::try_from(req.request) {
             Ok(request) => match request {
@@ -1832,13 +1756,11 @@ impl Handler for Control {
             return None;
         }
 
-        #[cfg(feature = "defmt")]
         trace!("CCID control_in {:?} {=[u8]:x}", req, _buf);
         match (req.request_type, req.recipient) {
             (RequestType::Standard, Recipient::Interface) => match req.request {
                 Request::GET_DESCRIPTOR => match (req.value >> 8) as u8 {
                     CCID_DESC_DESCTYPE_CCID => {
-                        #[cfg(feature = "defmt")]
                         trace!("CCID GET_DESCRIPTOR wValue={:#06x}", req.value);
                         Some(InResponse::Accepted(&self.ccid_descriptor))
                     }
@@ -1848,17 +1770,14 @@ impl Handler for Control {
                 _ => Some(InResponse::Rejected),
             },
             (RequestType::Class, Recipient::Interface) => {
-                #[cfg(feature = "defmt")]
                 trace!("CCID control_in {:?}", req);
                 match ClassRequest::try_from(req.request) {
                     Ok(request) => match request {
                         ClassRequest::GetClockFrequencies => {
-                            #[cfg(feature = "defmt")]
                             trace!("CCID GetClockFrequencies");
                             Some(InResponse::Accepted(&CCID_DESC_CLOCK_FREQUENCY_KHZ))
                         }
                         ClassRequest::GetDataRates => {
-                            #[cfg(feature = "defmt")]
                             trace!("CCID GetDataRates");
                             Some(InResponse::Accepted(&CCID_DESC_DATA_RATE_BPS))
                         }
@@ -2458,8 +2377,6 @@ impl Chain {
 impl core::fmt::Debug for Command {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let mut debug_struct = f.debug_struct("Command");
-        // write!("Command({:?})", &self.command_type()));
-        // // "Command");
 
         debug_struct
             .field("cmd", &self.command_type())
@@ -2486,12 +2403,6 @@ impl core::fmt::Debug for Command {
             };
         }
 
-        // let mut debug_struct = match self.msg_type() {
-        //     Ok(message_type) => debug_struct.field("type", &message_type),
-        //     Err(()) => debug_struct.field("type", &self[0]),
-        // };
-
-        // let has_data = self.len() > 0;
         debug_struct.finish()
     }
 }

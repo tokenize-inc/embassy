@@ -466,6 +466,7 @@ impl<'d> Handler for Control<'d> {
         // feature to fail to build, so leave it defmt-specific for now.
         #[cfg(feature = "defmt")]
         trace!("HID control_out {:?} {=[u8]:x}", req, data);
+
         match req.request {
             HID_REQ_SET_IDLE => {
                 if let Some(handler) = self.request_handler.as_mut() {
@@ -497,8 +498,6 @@ impl<'d> Handler for Control<'d> {
         if req.index != self.if_num.0 as u16 {
             return None;
         }
-
-        error!("HID control_in request: {:?}", req);
 
         match (req.request_type, req.recipient) {
             (RequestType::Standard, Recipient::Interface) => match req.request {
