@@ -341,8 +341,6 @@ impl<'d, D: Driver<'d>> UsbDevice<'d, D> {
     async fn handle_control(&mut self, req: [u8; 8]) {
         let req = Request::parse(&req);
 
-        trace!("control request: {:?}", req);
-
         match req.direction {
             Direction::In => self.handle_control_in(req).await,
             Direction::Out => self.handle_control_out(req).await,
@@ -360,7 +358,6 @@ impl<'d, D: Driver<'d>> UsbDevice<'d, D> {
         // a full-length packet is a short packet, thinking we're done sending data.
         // See https://github.com/hathach/tinyusb/issues/184
         if self.inner.address == 0 && max_packet_size < DEVICE_DESCRIPTOR_LEN && max_packet_size < resp_length {
-            trace!("received control req while not addressed: capping response to 1 packet.");
             resp_length = max_packet_size;
         }
 
@@ -376,8 +373,9 @@ impl<'d, D: Driver<'d>> UsbDevice<'d, D> {
                 for (first, last, chunk) in first_last(chunks) {
                     match self.control.data_in(chunk, first, last).await {
                         Ok(()) => {}
-                        Err(e) => {
-                            warn!("control accept_in failed: {:?}", e);
+                        Err(_e) => {
+                            #[cfg(feature = "defmt")]
+                            warn!("control accept_in failed: {:?}", _e);
                             return;
                         }
                     }
@@ -393,6 +391,7 @@ impl<'d, D: Driver<'d>> UsbDevice<'d, D> {
         let mut total = 0;
 
         if req_length > self.control_buf.len() {
+            #[cfg(feature = "defmt")]
             warn!(
                 "got CONTROL OUT with length {} higher than the control_buf len {}, rejecting.",
                 req_length,
@@ -406,8 +405,9 @@ impl<'d, D: Driver<'d>> UsbDevice<'d, D> {
         for (first, last, chunk) in first_last(chunks) {
             let size = match self.control.data_out(chunk, first, last).await {
                 Ok(x) => x,
-                Err(e) => {
-                    warn!("usb: failed to read CONTROL OUT data stage: {:?}", e);
+                Err(_e) => {
+                    #[cfg(feature = "defmt")]
+                    warn!("usb: failed to read CONTROL OUT data stage: {:?}", _e);
                     return;
                 }
             };
@@ -441,7 +441,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
     async fn handle_bus_event(&mut self, evt: Event) {
         match evt {
             Event::Reset => {
-                trace!("usb: reset");
                 self.device_state = UsbDeviceState::Default;
                 self.suspended = false;
                 self.remote_wakeup_enabled = false;
@@ -460,7 +459,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                 }
             }
             Event::Resume => {
-                trace!("usb: resume");
                 // Token-TODO SW-608: Resume Sequence not able to be detected.
                 //self.suspended = false;
                 for h in &mut self.handlers {
@@ -468,7 +466,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                 }
             }
             Event::Suspend => {
-                trace!("usb: suspend");
                 // Token-TODO SW-608: Resume Sequence not able to be detected.
                 //self.suspended = true;
                 for h in &mut self.handlers {
@@ -476,7 +473,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                 }
             }
             Event::PowerDetected => {
-                trace!("usb: power detected");
                 self.bus.enable().await;
                 self.device_state = UsbDeviceState::Default;
 
@@ -485,7 +481,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                 }
             }
             Event::PowerRemoved => {
-                trace!("usb: power removed");
                 self.bus.disable().await;
                 self.device_state = UsbDeviceState::Unpowered;
 
@@ -517,7 +512,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                     OutResponse::Accepted
                 }
                 (Request::SET_ADDRESS, addr @ 1..=127) => {
-                    debug!("SET_ADDRESS: {}", addr);
                     self.address = addr as u8;
                     self.set_address_pending = true;
                     self.device_state = UsbDeviceState::Addressed;
@@ -527,7 +521,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                     OutResponse::Accepted
                 }
                 (Request::SET_CONFIGURATION, CONFIGURATION_VALUE_U16) => {
-                    debug!("SET_CONFIGURATION: configured");
                     self.device_state = UsbDeviceState::Configured;
 
                     // Enable all endpoints of selected alt settings.
@@ -547,7 +540,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                 }
                 (Request::SET_CONFIGURATION, CONFIGURATION_NONE_U16) => {
                     if self.device_state != UsbDeviceState::Default {
-                        debug!("SET_CONFIGURATION: unconfigured");
                         self.device_state = UsbDeviceState::Addressed;
 
                         // Disable all endpoints.
@@ -576,7 +568,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                         let new_altsetting = req.value as u8;
 
                         if new_altsetting >= iface.num_alt_settings {
-                            warn!("SET_INTERFACE: trying to select alt setting out of range.");
                             return OutResponse::Rejected;
                         }
 
@@ -619,11 +610,9 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
     }
 
     fn handle_control_in<'a>(&'a mut self, req: Request, buf: &'a mut [u8]) -> InResponse<'a> {
-        debug!("control_in req: {:?}", req);
         match (req.request_type, req.recipient) {
             (RequestType::Standard, Recipient::Device) => match req.request {
                 Request::GET_STATUS => {
-                    debug!("GET_STATUS");
                     let mut status: u16 = 0x0000;
                     if self.self_powered {
                         status |= 0x0001;
@@ -634,10 +623,7 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                     buf[..2].copy_from_slice(&status.to_le_bytes());
                     InResponse::Accepted(&buf[..2])
                 }
-                Request::GET_DESCRIPTOR => {
-                    debug!("GET_DESCRIPTOR");
-                    self.handle_get_descriptor(req, buf)
-                }
+                Request::GET_DESCRIPTOR => self.handle_get_descriptor(req, buf),
                 Request::GET_CONFIGURATION => {
                     let status = match self.device_state {
                         UsbDeviceState::Configured => CONFIGURATION_VALUE,
