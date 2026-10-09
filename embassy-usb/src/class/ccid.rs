@@ -35,6 +35,8 @@ pub const CCID_HEADER_LEN: usize = 10;
 
 /// error codes for slot status and parameters responses, as per CCID spec for FAIL responses
 const CCID_CMD_FAIL: u8 = 1 << 6;
+/// ISO 7816-4 "no precise diagnosis", sent when the application's response cannot be delivered.
+const SW_NO_PRECISE_DIAGNOSIS: [u8; 2] = [0x6F, 0x00];
 
 /// raw packet
 pub type RawPacket = heapless::Vec<u8, PACKET_SIZE>;
@@ -215,7 +217,7 @@ pub const CCID_DESC_MECHANICAL: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
 /// dwFeatures
 pub const CCID_DESC_FEATURES: [u8; 4] = (Features::AutoActivation as u32
     | Features::AutoParamConfig as u32
-    | Features::ShortExtendedAPDULevel as u32
+    | Features::ShortAPDULevel as u32
     | Features::AutoVoltage as u32
     | Features::AutoClockChange as u32
     | Features::AutoBaudRateChange as u32
@@ -310,8 +312,8 @@ pub const DEFAULT_CCID_DESCRIPTOR: [u8; CCID_DESC_BLENGTH as usize] = [
     // Auto clock change
     // Auto baud rate change
     // Auto parameter negotiation made by CCID
-    // Short and extended APDU level exchange
-    // 0xFE, 0x00, 0x04, 0x00,
+    // Short APDU level exchange
+    // 0xFE, 0x00, 0x02, 0x00,
     // ICCD: lower word (=0840): only requests valid for USB-ICC
     // upper word: 0000 = char level, 0002 = short APDU, 0004 = short+exteded APDU
     CCID_DESC_FEATURES[0],
@@ -769,34 +771,29 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         }
                     };
 
-                    // If packet is larger than the max usb size we need to split in into chunks and send with correct chaining
-                    if raw_packet.len() > PACKET_SIZE - CCID_HEADER_LEN {
-                        trace!("CCID: Packet larger than max USB packet size, splitting into chunks with chaining");
-
-                        let max_chunk = PACKET_SIZE - CCID_HEADER_LEN;
-                        let chunk = raw_packet[..max_chunk].to_vec();
-
-                        let data: ExtPacket = DataBlock::new(response_seq, Chain::Begins, &chunk).into();
-                        trace!("CCID: Sending Chained response packet to host: {=[u8]:x}", &data);
-
-                        if let Err(_e) = self.write(&data).await {
-                            warn!("CCID: Failed to write Chained response packet: {:?}", _e);
-                        }
-
-                        self.state = CcidReaderState::Sending;
-                        self.sent = chunk.len();
-                        self.outbox = Some(raw_packet);
+                    // The reader advertises short APDU level, where a response is always a single unchained
+                    // RDR_to_PC_DataBlock (the bulk endpoint splits it across USB packets). Responses longer than
+                    // 256 data bytes + SW are returned by the card as 61XX for the host to fetch with GET RESPONSE,
+                    // so anything that does not fit one message is an application error.
+                    let response: &[u8] = if raw_packet.len() <= MAX_MSG_LENGTH - CCID_HEADER_LEN {
+                        &raw_packet
                     } else {
-                        trace!("CCID: Packet fits in single USB packet, sending with beginsAndEnds");
-                        // Wrap in a PRDR_to_PC_DataBlock response and send to host
-                        let data: ExtPacket = DataBlock::new(response_seq, Chain::BeginsAndEnds, &raw_packet).into();
-                        trace!("CCID: Sending response packet to host: {=[u8]:x}", &data);
+                        error!(
+                            "CCID: Application response of {} bytes exceeds the {} byte maximum",
+                            raw_packet.len(),
+                            MAX_MSG_LENGTH - CCID_HEADER_LEN
+                        );
+                        &SW_NO_PRECISE_DIAGNOSIS
+                    };
 
-                        if let Err(_e) = self.write(&data).await {
-                            warn!("CCID: Failed to write response packet: {:?}", _e);
-                        }
-                        self.state = CcidReaderState::Idle;
+                    // Wrap in a PRDR_to_PC_DataBlock response and send to host
+                    let data: ExtPacket = DataBlock::new(response_seq, Chain::BeginsAndEnds, response).into();
+                    trace!("CCID: Sending response packet to host: {=[u8]:x}", &data);
+
+                    if let Err(_e) = self.write(&data).await {
+                        warn!("CCID: Failed to write response packet: {:?}", _e);
                     }
+                    self.state = CcidReaderState::Idle;
                 }
                 Either3::Second(Ok(response_type)) => match response_type {
                     ResponseType::Internal(packet) => {
