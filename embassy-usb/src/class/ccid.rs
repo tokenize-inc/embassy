@@ -241,10 +241,10 @@ pub const CCID_DESC_CLASS_ENVELOPE: u8 = 0xFF;
 pub const CCID_DESC_LCD_LAYOUT: [u8; 2] = [0x00, 0x00];
 /// bPinSupport (0x0 = none, 0x01 = verification, 0x02 = modification)
 ///
-/// Set bit 0 (here or in a custom `Config::ccid_descriptor`) to accept PIN verification with
-/// PC_to_RDR_Secure; the application must then handle [`CcidRequest::VerifyPin`]. While it is
-/// clear, PC_to_RDR_Secure is rejected as unsupported.
-pub const CCID_DESC_PIN_SUPPORT: u8 = 0x00;
+/// Bit 0 advertises a PIN pad: PC_to_RDR_Secure PIN verification is accepted and the application
+/// must handle [`CcidRequest::VerifyPin`]. Clear it (here or in a custom `Config::ccid_descriptor`)
+/// to reject PC_to_RDR_Secure as unsupported.
+pub const CCID_DESC_PIN_SUPPORT: u8 = PIN_SUPPORT_VERIFY;
 /// Offset of bPinSupport in the CCID class descriptor.
 const CCID_DESC_PIN_SUPPORT_OFFSET: usize = 52;
 /// bPinSupport bit: PIN verification.
