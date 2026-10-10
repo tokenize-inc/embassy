@@ -68,11 +68,15 @@ enum PipeError {
     IccMute = 0xfe,
     XfrParityError = 0xfd,
     //..
+    HwError = 0xFB,
+    //..
     CmdSlotBusy = 0xE0,
     // Offset of the offending field in the command: dwLength.
     BadLength = 0x01,
     // Offset of the offending field in the command: bSlot (slot does not exist).
     BadSlot = 0x05,
+    // Offset of the offending field in the command: wLevelParameter (chaining).
+    BadLevelParameter = 0x08,
     CommandNotSupported = 0x00,
 }
 
@@ -1245,8 +1249,8 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
 
     /// Resets the reader after a rejected command chain and builds a failed
     /// RDR_to_PC_DataBlock for the current XfrBlock.
-    fn reject_chain(&mut self) -> ResponseType {
-        let packet = self.failed_data_block(PipeError::BadLength);
+    fn reject_chain(&mut self, error: PipeError) -> ResponseType {
+        let packet = self.failed_data_block(error);
         self.reset_state();
         ResponseType::Internal(packet)
     }
@@ -1280,7 +1284,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     // The fragment can carry up to MAX_MSG_LENGTH - CCID_HEADER_LEN bytes, so it is
                     // copied straight into the boxed buffer rather than through a USB-packet-sized RawPacket.
                     if !self.append_chain_fragment(command.data()) {
-                        return Ok(self.reject_chain());
+                        return Ok(self.reject_chain(PipeError::BadLength));
                     }
 
                     self.state = CcidReaderState::Receiving;
@@ -1289,14 +1293,12 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     ))
                 }
                 Err(_) => {
-                    error!("Unknown chain");
-                    self.reset_state();
-                    Ok(ResponseType::None)
+                    error!("CCID: Unknown chain in XfrBlock, rejecting");
+                    Ok(self.reject_chain(PipeError::BadLevelParameter))
                 }
                 _ => {
-                    error!("unexpectedly in idle state");
-                    self.reset_state();
-                    Ok(ResponseType::None)
+                    error!("CCID: Chain continuation in XfrBlock with no chain in progress, rejecting");
+                    Ok(self.reject_chain(PipeError::BadLevelParameter))
                 }
             },
             CcidReaderState::Receiving => match chain {
@@ -1305,11 +1307,10 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
 
                     if self.outbox.is_none() {
                         error!("Received chained packet but outbox is None");
-                        self.reset_state();
-                        return Ok(ResponseType::None);
+                        return Ok(self.reject_chain(PipeError::HwError));
                     }
                     if !self.append_chain_fragment(command.data()) {
-                        return Ok(self.reject_chain());
+                        return Ok(self.reject_chain(PipeError::BadLength));
                     }
 
                     Ok(ResponseType::Internal(
@@ -1321,7 +1322,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
 
                     if self.outbox.is_some() {
                         if !self.append_chain_fragment(command.data()) {
-                            return Ok(self.reject_chain());
+                            return Ok(self.reject_chain(PipeError::BadLength));
                         }
 
                         let full_message = self.outbox.take().unwrap_or_default();
@@ -1331,25 +1332,24 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         Ok(ResponseType::External(CcidRequest::Apdu(full_message)))
                     } else {
                         error!("Received chained packet but outbox is None");
-                        self.reset_state();
-                        Ok(ResponseType::None)
+                        Ok(self.reject_chain(PipeError::HwError))
                     }
                 }
+                // The partial chain is abandoned: the host must restart it.
                 Err(_) => {
-                    error!("Unknown chain");
-                    self.reset_state();
-                    Ok(ResponseType::None)
+                    error!("CCID: Unknown chain in XfrBlock, rejecting");
+                    Ok(self.reject_chain(PipeError::BadLevelParameter))
                 }
                 _ => {
-                    error!("unexpectedly in idle state");
-                    self.reset_state();
-                    Ok(ResponseType::None)
+                    error!("CCID: XfrBlock does not continue the chain in progress, rejecting");
+                    Ok(self.reject_chain(PipeError::BadLevelParameter))
                 }
             },
             CcidReaderState::Processing | CcidReaderState::ReadyToSend => {
-                error!("Received XfrBlock while already processing another, rejecting");
-                self.reset_state();
-                Ok(ResponseType::None)
+                // Leave the command in progress untouched: its response is still owed, under
+                // `pending_seq`. The busy reply carries this command's bSeq.
+                warn!("CCID: XfrBlock while another command is in progress, rejecting");
+                Ok(ResponseType::Internal(self.failed_data_block(PipeError::CmdSlotBusy)))
             }
             CcidReaderState::Sending => match chain {
                 Ok(Chain::ExpectingMore) => {
