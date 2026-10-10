@@ -341,8 +341,6 @@ impl<'d, D: Driver<'d>> UsbDevice<'d, D> {
     async fn handle_control(&mut self, req: [u8; 8]) {
         let req = Request::parse(&req);
 
-        trace!("control request: {:?}", req);
-
         match req.direction {
             Direction::In => self.handle_control_in(req).await,
             Direction::Out => self.handle_control_out(req).await,
@@ -360,7 +358,6 @@ impl<'d, D: Driver<'d>> UsbDevice<'d, D> {
         // a full-length packet is a short packet, thinking we're done sending data.
         // See https://github.com/hathach/tinyusb/issues/184
         if self.inner.address == 0 && max_packet_size < DEVICE_DESCRIPTOR_LEN && max_packet_size < resp_length {
-            trace!("received control req while not addressed: capping response to 1 packet.");
             resp_length = max_packet_size;
         }
 
@@ -441,7 +438,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
     async fn handle_bus_event(&mut self, evt: Event) {
         match evt {
             Event::Reset => {
-                trace!("usb: reset");
                 self.device_state = UsbDeviceState::Default;
                 self.suspended = false;
                 self.remote_wakeup_enabled = false;
@@ -460,7 +456,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                 }
             }
             Event::Resume => {
-                trace!("usb: resume");
                 // Token-TODO SW-608: Resume Sequence not able to be detected.
                 //self.suspended = false;
                 for h in &mut self.handlers {
@@ -468,7 +463,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                 }
             }
             Event::Suspend => {
-                trace!("usb: suspend");
                 // Token-TODO SW-608: Resume Sequence not able to be detected.
                 //self.suspended = true;
                 for h in &mut self.handlers {
@@ -476,7 +470,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                 }
             }
             Event::PowerDetected => {
-                trace!("usb: power detected");
                 self.bus.enable().await;
                 self.device_state = UsbDeviceState::Default;
 
@@ -485,7 +478,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                 }
             }
             Event::PowerRemoved => {
-                trace!("usb: power removed");
                 self.bus.disable().await;
                 self.device_state = UsbDeviceState::Unpowered;
 
@@ -526,7 +518,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                     OutResponse::Accepted
                 }
                 (Request::SET_CONFIGURATION, CONFIGURATION_VALUE_U16) => {
-                    debug!("SET_CONFIGURATION: configured");
                     self.device_state = UsbDeviceState::Configured;
 
                     // Enable all endpoints of selected alt settings.
@@ -546,7 +537,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                 }
                 (Request::SET_CONFIGURATION, CONFIGURATION_NONE_U16) => {
                     if self.device_state != UsbDeviceState::Default {
-                        debug!("SET_CONFIGURATION: unconfigured");
                         self.device_state = UsbDeviceState::Addressed;
 
                         // Disable all endpoints.
@@ -575,7 +565,6 @@ impl<'d, D: Driver<'d>> Inner<'d, D> {
                         let new_altsetting = req.value as u8;
 
                         if new_altsetting >= iface.num_alt_settings {
-                            warn!("SET_INTERFACE: trying to select alt setting out of range.");
                             return OutResponse::Rejected;
                         }
 

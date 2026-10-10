@@ -466,6 +466,7 @@ impl<'d> Handler for Control<'d> {
         // feature to fail to build, so leave it defmt-specific for now.
         #[cfg(feature = "defmt")]
         trace!("HID control_out {:?} {=[u8]:x}", req, data);
+
         match req.request {
             HID_REQ_SET_IDLE => {
                 if let Some(handler) = self.request_handler.as_mut() {

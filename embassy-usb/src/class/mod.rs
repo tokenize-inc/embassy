@@ -1,4 +1,6 @@
 //! Implementations of well-known USB classes.
+#[cfg(feature = "ccid")]
+pub mod ccid;
 pub mod cdc_acm;
 pub mod cdc_ncm;
 pub mod hid;
