@@ -7,7 +7,7 @@ use core::mem::MaybeUninit;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{select4, Either4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
 use embassy_sync::signal::Signal;
@@ -387,6 +387,19 @@ pub struct Config<'d> {
     /// The assembled APDU is heap-allocated, so this bounds how much memory a host can make the
     /// driver allocate. Chains that would exceed it are rejected and the reader is reset.
     pub max_apdu_size: usize,
+
+    /// Called when the host powers the card off (PC_to_RDR_IccPowerOff), ending the card session.
+    pub on_icc_power_off: Option<fn()>,
+
+    /// Signalled by the application when the card lost its session state without the host powering it off, for
+    /// example because the card was reset to serve another interface. The reader then marks the card inactive and
+    /// notifies the host with RDR_to_PC_NotifySlotChange, so the host powers it on again instead of sending APDUs
+    /// that rely on state the card no longer holds.
+    ///
+    /// The reset ends the reader session: a partially received command is dropped, queued application responses are
+    /// discarded, and an XfrBlock still with the application is answered with an error. The application must not
+    /// answer requests it received before signalling.
+    pub card_reset: Option<&'d Signal<CriticalSectionRawMutex, ()>>,
 }
 
 /// Report ID
@@ -501,6 +514,10 @@ pub struct CcidReaderWriter<'d, D: Driver<'d>, const READ_N: usize, const WRITE_
     // A message rejected after its header was parsed, whose remaining packets are being dropped
     // before the rejection is sent.
     discarding: Option<DiscardedMessage>,
+    // Called when the host powers the card off (Config::on_icc_power_off).
+    on_icc_power_off: Option<fn()>,
+    // Signalled by the application when the card was reset under the host (Config::card_reset).
+    card_reset: Option<&'d Signal<CriticalSectionRawMutex, ()>>,
 }
 
 /// A message rejected after its header was parsed. The rest of its transfer is read and dropped
@@ -604,6 +621,8 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, CcidRequest, WRITE_N>,
     ) -> Self {
         let max_apdu_size = config.max_apdu_size;
+        let on_icc_power_off = config.on_icc_power_off;
+        let card_reset = config.card_reset;
         let (ep_out, ep_in, ep_int_in, session_reset, abort_signal, pin_verify_supported) =
             build(builder, state, config);
 
@@ -635,6 +654,8 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             discarding: None,
             ccid_to_app,
             protocol_data: ProtocolData::default(),
+            on_icc_power_off,
+            card_reset,
         }
     }
 
@@ -770,8 +791,22 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             }
 
             let abort_signal = self.abort_signal.clone();
-            match select3(app_to_ccid.receive(), self.read(&mut buf), abort_signal.wait()).await {
-                Either3::First(raw_packet) => {
+            let card_reset = self.card_reset;
+            let card_reset = async {
+                match card_reset {
+                    Some(signal) => signal.wait().await,
+                    None => core::future::pending().await,
+                }
+            };
+            match select4(
+                app_to_ccid.receive(),
+                self.read(&mut buf),
+                abort_signal.wait(),
+                card_reset,
+            )
+            .await
+            {
+                Either4::First(raw_packet) => {
                     if self.session_reset.swap(false, Ordering::AcqRel) {
                         // This answers a command from the previous session; the host won't expect it.
                         trace!("CCID: Dropping application response from before USB reset");
@@ -825,7 +860,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     }
                     self.state = CcidReaderState::Idle;
                 }
-                Either3::Second(Ok(response_type)) => match response_type {
+                Either4::Second(Ok(response_type)) => match response_type {
                     ResponseType::Internal(packet) => {
                         trace!(
                             "CCID: Received packet from host to send back to host: {=[u8]:x}",
@@ -855,7 +890,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         trace!("CCID: Nothing to handle");
                     }
                 },
-                Either3::Second(Err(e)) => {
+                Either4::Second(Err(e)) => {
                     warn!("CCID: Failed to read packet from host: {:?}", e);
                     // Disabled means the endpoint went away (bus reset or deconfiguration), which
                     // ends the session even if no reset was signalled.
@@ -863,7 +898,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         self.reset_session(app_to_ccid);
                     }
                 }
-                Either3::Third(request) => {
+                Either4::Third(request) => {
                     trace!("CCID: Control ABORT for slot {} seq {}", request.slot, request.seq);
                     self.control_abort = Some(request);
                     // The bulk half may already have arrived and be waiting for this one.
@@ -872,6 +907,27 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         if let Err(_e) = self.write(&packet).await {
                             warn!("CCID: Failed to write ABORT response: {:?}", _e);
                         }
+                    }
+                }
+                Either4::Fourth(()) => {
+                    trace!("CCID: Card reset by the application, ending the reader session");
+                    let pending = self.pending_seq.map(|seq| (self.slot, seq));
+                    // Drop any partially received chain and queued responses, so the host's first command after
+                    // powering the card on again is parsed fresh.
+                    self.reset_session(app_to_ccid);
+                    self.slot_status = 0x01; // An ICC is present and inactive
+
+                    // The host is still waiting for the XfrBlock that was with the application; the application
+                    // will not answer it.
+                    if let Some((slot, seq)) = pending {
+                        let packet = self.failed_response(CommandType::XfrBlock as u8, slot, seq, PipeError::IccMute);
+                        if let Err(_e) = self.write(&packet).await {
+                            warn!("CCID: Failed to fail XfrBlock interrupted by card reset: {:?}", _e);
+                        }
+                    }
+
+                    if let Err(_e) = self.write_interrupt(true).await {
+                        warn!("CCID: Failed to write slot change notification: {:?}", _e);
                     }
                 }
             }
@@ -1035,9 +1091,17 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     Command::IccPowerOff(_command) => {
                         trace!("CCID: IccPowerOff command received");
                         self.slot_status = 0x01; // An ICC is present and inactive
-                        Ok(ResponseType::Internal(
-                            self.rdr_to_pc_slot_status(self.slot_status, 0x00).await,
-                        ))
+
+                        // Built before reset_state, which clears the bSeq this response must carry.
+                        let response = self.rdr_to_pc_slot_status(self.slot_status, 0x00).await;
+                        // Powering the card off ends its session: drop any partially assembled message or command
+                        // chain, so the first command after IccPowerOn is parsed fresh. discard_app_response is kept,
+                        // as a response to an aborted command may still be on its way from the application.
+                        self.reset_state();
+                        if let Some(on_icc_power_off) = self.on_icc_power_off {
+                            on_icc_power_off();
+                        }
+                        Ok(ResponseType::Internal(response))
                     }
                     Command::GetSlotStatus(_command) => {
                         trace!("CCID: GetSlotStatus command received");
@@ -1047,7 +1111,10 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     }
                     Command::XfrBlock(command) => {
                         trace!("CCID: XfrBlock command received, data: {=[u8]:x}", command.data());
-                        self.handle_xfer(command).await
+                        match self.reject_if_card_inactive() {
+                            Some(rejection) => Ok(rejection),
+                            None => self.handle_xfer(command).await,
+                        }
                     }
                     // Handled above, before the abort-pending check.
                     Command::Abort(_command) => Ok(ResponseType::None),
@@ -1095,7 +1162,9 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     }
                     Command::Secure(command) => {
                         trace!("CCID: Secure command received, data: {=[u8]:x}", command.data());
-                        Ok(self.handle_secure(command))
+                        Ok(self
+                            .reject_if_card_inactive()
+                            .unwrap_or_else(|| self.handle_secure(command)))
                     }
                     Command::Mechanical(_mechanical) => {
                         trace!("CCID: Mechanical command received, data: {=[u8]:x}", _mechanical);
@@ -1307,6 +1376,17 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
 
     /// Handles PC_to_RDR_Secure. Only PIN verification is supported: the request is passed to the
     /// application, which supplies the PIN, and its response is returned like an XfrBlock's.
+    /// Rejects a command that needs the card (XfrBlock, Secure) while the card is inactive, i.e. powered off by the
+    /// host or reset by the application: the host must power it on again first, so commands cannot reach the
+    /// application across a card session boundary.
+    fn reject_if_card_inactive(&self) -> Option<ResponseType> {
+        if self.slot_status == 0x00 {
+            return None;
+        }
+        warn!("CCID: Card command while the card is inactive, rejecting");
+        Some(ResponseType::Internal(self.failed_data_block(PipeError::IccMute)))
+    }
+
     fn handle_secure(&mut self, command: Secure) -> ResponseType {
         if !self.pin_verify_supported {
             trace!("CCID: Secure command received but PIN verification is not advertised, rejecting");
@@ -1340,7 +1420,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         packet[0] = 0x80; // bMessageType: RDR_to_PC_DataBlock
         packet[5] = self.slot;
         packet[6] = self.seq;
-        packet[7] = CCID_CMD_FAIL;
+        packet[7] = CCID_CMD_FAIL | self.slot_status;
         packet[8] = error as u8;
         packet
     }
