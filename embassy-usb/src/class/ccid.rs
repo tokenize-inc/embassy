@@ -893,6 +893,11 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         }
 
         if !self.receiving_long {
+            if packet.is_empty() {
+                // Ends a transfer, but no message is being assembled.
+                trace!("CCID: Ignoring zero-length packet");
+                return Ok(ResponseType::None);
+            }
             if packet.len() < CCID_HEADER_LEN {
                 error!("CCID: unexpected short packet");
                 self.reset_state();
@@ -913,16 +918,16 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     message_len,
                     self.ext_packet.capacity()
                 );
-                let discard = DiscardedMessage {
-                    message_type: packet[0],
-                    slot: packet[5],
-                    seq: packet[6],
-                    remaining: message_len,
-                };
-                self.reset_state();
-                return Ok(self.drain_rejected(discard, packet.len()));
+                return Ok(self.reject_message(message_len, packet.len()));
             }
             if packet.len() < message_len {
+                if packet.len() < self.bulk_out.max_packet_size() {
+                    error!(
+                        "CCID: Transfer ended {} bytes short of dwLength",
+                        message_len - packet.len()
+                    );
+                    return Ok(self.reject_message(0, packet.len()));
+                }
                 self.receiving_long = true;
                 self.in_chain = 1;
                 self.long_packet_missing = message_len - packet.len();
@@ -944,14 +949,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 );
                 // The host sent more than the header declared, so the declared message is already
                 // complete; answer it now. The failed extend left the header in place.
-                let discard = DiscardedMessage {
-                    message_type: self.ext_packet[0],
-                    slot: self.ext_packet[5],
-                    seq: self.ext_packet[6],
-                    remaining: 0,
-                };
-                self.reset_state();
-                return Ok(self.drain_rejected(discard, packet.len()));
+                return Ok(self.reject_message(0, packet.len()));
             }
             self.in_chain += 1;
             if packet.len() > self.long_packet_missing {
@@ -961,6 +959,14 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                 self.long_packet_missing -= packet.len();
             }
             if self.long_packet_missing != 0 {
+                // A short or zero-length packet ends the transfer before dwLength was reached.
+                if packet.len() < self.bulk_out.max_packet_size() {
+                    error!(
+                        "CCID: Transfer ended {} bytes short of dwLength",
+                        self.long_packet_missing
+                    );
+                    return Ok(self.reject_message(0, packet.len()));
+                }
                 return Ok(ResponseType::None);
             }
 
@@ -1199,11 +1205,25 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         self.discarding = None;
     }
 
+    /// Rejects the message whose header is in `ext_packet` with BadLength, once the rest of its
+    /// transfer has been drained. `remaining` is the message's length per its dwLength, less what
+    /// arrived before `packet_len`; 0 answers it as soon as `packet_len` is counted.
+    fn reject_message(&mut self, remaining: usize, packet_len: usize) -> ResponseType {
+        let discard = DiscardedMessage {
+            message_type: self.ext_packet[0],
+            slot: self.ext_packet[5],
+            seq: self.ext_packet[6],
+            remaining,
+        };
+        self.reset_state();
+        self.drain_rejected(discard, packet_len)
+    }
+
     /// Drops one packet of a rejected message's transfer. Once the transfer has ended, answers
     /// the message with BadLength.
     ///
-    /// The transfer ends when the bytes its dwLength declared have arrived, or on a short packet,
-    /// which ends a USB transfer whatever the header claimed (so a bogus dwLength can't make us
+    /// The transfer ends when the bytes its dwLength declared have arrived, or on a short or
+    /// zero-length packet, which ends a USB transfer whatever the header claimed (so a bogus dwLength can't make us
     /// discard forever). The reply waits until then: a host that writes the whole command before
     /// reading the response would otherwise block on its write while we block on ours.
     fn drain_rejected(&mut self, mut discard: DiscardedMessage, packet_len: usize) -> ResponseType {
@@ -1733,36 +1753,34 @@ impl<'d, D: Driver<'d>> CcidBulkOut<'d, D> {
     /// CCID messages longer than one packet are reassembled by the caller (see
     /// [`CcidReaderWriter::handle_packet`]). Reading one packet at a time keeps this
     /// future cancel-safe: dropping it never loses data already taken from the endpoint.
-    /// Zero-length packets are skipped. `buf` must hold at least one max-size packet.
+    /// Zero-length packets are returned (as 0), since they can end a transfer whose dwLength
+    /// overstated its size. `buf` must hold at least one max-size packet.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
         let max_packet_size = self.max_packet_size();
         assert!(buf.len() >= max_packet_size);
 
-        loop {
-            match self.ep_out.read(&mut buf[..max_packet_size]).await {
-                Ok(0) => continue,
-                Ok(size) => {
-                    trace!("CCID Read packet of size {} from host", size);
-                    trace!("CCID Read packet: {=[u8]:x}", &buf[..size]);
-                    return Ok(size);
-                }
-                Err(err) => {
-                    let read_error: ReadError = err.into();
-                    match read_error {
-                        ReadError::BufferOverflow => {
-                            error!(
-                                "Host sent a packet larger than the endpoint max packet size ({})",
-                                max_packet_size
-                            );
-                        }
-                        ReadError::Disabled => {
-                            warn!("Endpoint was disabled while reading");
-                            self.ready().await;
-                        }
-                        ReadError::Sync(_) => unreachable!(),
+        match self.ep_out.read(&mut buf[..max_packet_size]).await {
+            Ok(size) => {
+                trace!("CCID Read packet of size {} from host", size);
+                trace!("CCID Read packet: {=[u8]:x}", &buf[..size]);
+                Ok(size)
+            }
+            Err(err) => {
+                let read_error: ReadError = err.into();
+                match read_error {
+                    ReadError::BufferOverflow => {
+                        error!(
+                            "Host sent a packet larger than the endpoint max packet size ({})",
+                            max_packet_size
+                        );
                     }
-                    return Err(read_error);
+                    ReadError::Disabled => {
+                        warn!("Endpoint was disabled while reading");
+                        self.ready().await;
+                    }
+                    ReadError::Sync(_) => unreachable!(),
                 }
+                Err(read_error)
             }
         }
     }
