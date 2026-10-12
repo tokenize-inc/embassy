@@ -7,7 +7,7 @@ use core::mem::MaybeUninit;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{select4, Either4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
 use embassy_sync::signal::Signal;
@@ -387,6 +387,15 @@ pub struct Config<'d> {
     /// The assembled APDU is heap-allocated, so this bounds how much memory a host can make the
     /// driver allocate. Chains that would exceed it are rejected and the reader is reset.
     pub max_apdu_size: usize,
+
+    /// Called when the host powers the card off (PC_to_RDR_IccPowerOff), ending the card session.
+    pub on_icc_power_off: Option<fn()>,
+
+    /// Signalled by the application when the card lost its session state without the host powering it off, for
+    /// example because the card was reset to serve another interface. The reader then marks the card inactive and
+    /// notifies the host with RDR_to_PC_NotifySlotChange, so the host powers it on again instead of sending APDUs
+    /// that rely on state the card no longer holds.
+    pub card_reset: Option<&'d Signal<CriticalSectionRawMutex, ()>>,
 }
 
 /// Report ID
@@ -501,6 +510,10 @@ pub struct CcidReaderWriter<'d, D: Driver<'d>, const READ_N: usize, const WRITE_
     // A message rejected after its header was parsed, whose remaining packets are being dropped
     // before the rejection is sent.
     discarding: Option<DiscardedMessage>,
+    // Called when the host powers the card off (Config::on_icc_power_off).
+    on_icc_power_off: Option<fn()>,
+    // Signalled by the application when the card was reset under the host (Config::card_reset).
+    card_reset: Option<&'d Signal<CriticalSectionRawMutex, ()>>,
 }
 
 /// A message rejected after its header was parsed. The rest of its transfer is read and dropped
@@ -604,6 +617,8 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         ccid_to_app: &'static mut Sender<'static, CriticalSectionRawMutex, CcidRequest, WRITE_N>,
     ) -> Self {
         let max_apdu_size = config.max_apdu_size;
+        let on_icc_power_off = config.on_icc_power_off;
+        let card_reset = config.card_reset;
         let (ep_out, ep_in, ep_int_in, session_reset, abort_signal, pin_verify_supported) =
             build(builder, state, config);
 
@@ -635,6 +650,8 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             discarding: None,
             ccid_to_app,
             protocol_data: ProtocolData::default(),
+            on_icc_power_off,
+            card_reset,
         }
     }
 
@@ -770,8 +787,22 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             }
 
             let abort_signal = self.abort_signal.clone();
-            match select3(app_to_ccid.receive(), self.read(&mut buf), abort_signal.wait()).await {
-                Either3::First(raw_packet) => {
+            let card_reset = self.card_reset;
+            let card_reset = async {
+                match card_reset {
+                    Some(signal) => signal.wait().await,
+                    None => core::future::pending().await,
+                }
+            };
+            match select4(
+                app_to_ccid.receive(),
+                self.read(&mut buf),
+                abort_signal.wait(),
+                card_reset,
+            )
+            .await
+            {
+                Either4::First(raw_packet) => {
                     if self.session_reset.swap(false, Ordering::AcqRel) {
                         // This answers a command from the previous session; the host won't expect it.
                         trace!("CCID: Dropping application response from before USB reset");
@@ -825,7 +856,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     }
                     self.state = CcidReaderState::Idle;
                 }
-                Either3::Second(Ok(response_type)) => match response_type {
+                Either4::Second(Ok(response_type)) => match response_type {
                     ResponseType::Internal(packet) => {
                         trace!(
                             "CCID: Received packet from host to send back to host: {=[u8]:x}",
@@ -855,7 +886,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         trace!("CCID: Nothing to handle");
                     }
                 },
-                Either3::Second(Err(e)) => {
+                Either4::Second(Err(e)) => {
                     warn!("CCID: Failed to read packet from host: {:?}", e);
                     // Disabled means the endpoint went away (bus reset or deconfiguration), which
                     // ends the session even if no reset was signalled.
@@ -863,7 +894,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         self.reset_session(app_to_ccid);
                     }
                 }
-                Either3::Third(request) => {
+                Either4::Third(request) => {
                     trace!("CCID: Control ABORT for slot {} seq {}", request.slot, request.seq);
                     self.control_abort = Some(request);
                     // The bulk half may already have arrived and be waiting for this one.
@@ -872,6 +903,13 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                         if let Err(_e) = self.write(&packet).await {
                             warn!("CCID: Failed to write ABORT response: {:?}", _e);
                         }
+                    }
+                }
+                Either4::Fourth(()) => {
+                    trace!("CCID: Card reset by the application, notifying the host");
+                    self.slot_status = 0x01; // An ICC is present and inactive
+                    if let Err(_e) = self.write_interrupt(true).await {
+                        warn!("CCID: Failed to write slot change notification: {:?}", _e);
                     }
                 }
             }
@@ -1035,6 +1073,9 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     Command::IccPowerOff(_command) => {
                         trace!("CCID: IccPowerOff command received");
                         self.slot_status = 0x01; // An ICC is present and inactive
+                        if let Some(on_icc_power_off) = self.on_icc_power_off {
+                            on_icc_power_off();
+                        }
                         Ok(ResponseType::Internal(
                             self.rdr_to_pc_slot_status(self.slot_status, 0x00).await,
                         ))
@@ -1047,7 +1088,13 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     }
                     Command::XfrBlock(command) => {
                         trace!("CCID: XfrBlock command received, data: {=[u8]:x}", command.data());
-                        self.handle_xfer(command).await
+                        if self.slot_status != 0x00 {
+                            // The card was powered off or reset; the host must power it on again first.
+                            warn!("CCID: XfrBlock while the card is inactive, rejecting");
+                            Ok(ResponseType::Internal(self.failed_data_block(PipeError::IccMute)))
+                        } else {
+                            self.handle_xfer(command).await
+                        }
                     }
                     // Handled above, before the abort-pending check.
                     Command::Abort(_command) => Ok(ResponseType::None),
@@ -1340,7 +1387,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         packet[0] = 0x80; // bMessageType: RDR_to_PC_DataBlock
         packet[5] = self.slot;
         packet[6] = self.seq;
-        packet[7] = CCID_CMD_FAIL;
+        packet[7] = CCID_CMD_FAIL | self.slot_status;
         packet[8] = error as u8;
         packet
     }
