@@ -395,6 +395,10 @@ pub struct Config<'d> {
     /// example because the card was reset to serve another interface. The reader then marks the card inactive and
     /// notifies the host with RDR_to_PC_NotifySlotChange, so the host powers it on again instead of sending APDUs
     /// that rely on state the card no longer holds.
+    ///
+    /// The reset ends the reader session: a partially received command is dropped, queued application responses are
+    /// discarded, and an XfrBlock still with the application is answered with an error. The application must not
+    /// answer requests it received before signalling.
     pub card_reset: Option<&'d Signal<CriticalSectionRawMutex, ()>>,
 }
 
@@ -906,8 +910,22 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     }
                 }
                 Either4::Fourth(()) => {
-                    trace!("CCID: Card reset by the application, notifying the host");
+                    trace!("CCID: Card reset by the application, ending the reader session");
+                    let pending = self.pending_seq.map(|seq| (self.slot, seq));
+                    // Drop any partially received chain and queued responses, so the host's first command after
+                    // powering the card on again is parsed fresh.
+                    self.reset_session(app_to_ccid);
                     self.slot_status = 0x01; // An ICC is present and inactive
+
+                    // The host is still waiting for the XfrBlock that was with the application; the application
+                    // will not answer it.
+                    if let Some((slot, seq)) = pending {
+                        let packet = self.failed_response(CommandType::XfrBlock as u8, slot, seq, PipeError::IccMute);
+                        if let Err(_e) = self.write(&packet).await {
+                            warn!("CCID: Failed to fail XfrBlock interrupted by card reset: {:?}", _e);
+                        }
+                    }
+
                     if let Err(_e) = self.write_interrupt(true).await {
                         warn!("CCID: Failed to write slot change notification: {:?}", _e);
                     }
@@ -1073,12 +1091,17 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     Command::IccPowerOff(_command) => {
                         trace!("CCID: IccPowerOff command received");
                         self.slot_status = 0x01; // An ICC is present and inactive
+
+                        // Built before reset_state, which clears the bSeq this response must carry.
+                        let response = self.rdr_to_pc_slot_status(self.slot_status, 0x00).await;
+                        // Powering the card off ends its session: drop any partially assembled message or command
+                        // chain, so the first command after IccPowerOn is parsed fresh. discard_app_response is kept,
+                        // as a response to an aborted command may still be on its way from the application.
+                        self.reset_state();
                         if let Some(on_icc_power_off) = self.on_icc_power_off {
                             on_icc_power_off();
                         }
-                        Ok(ResponseType::Internal(
-                            self.rdr_to_pc_slot_status(self.slot_status, 0x00).await,
-                        ))
+                        Ok(ResponseType::Internal(response))
                     }
                     Command::GetSlotStatus(_command) => {
                         trace!("CCID: GetSlotStatus command received");
@@ -1088,12 +1111,9 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     }
                     Command::XfrBlock(command) => {
                         trace!("CCID: XfrBlock command received, data: {=[u8]:x}", command.data());
-                        if self.slot_status != 0x00 {
-                            // The card was powered off or reset; the host must power it on again first.
-                            warn!("CCID: XfrBlock while the card is inactive, rejecting");
-                            Ok(ResponseType::Internal(self.failed_data_block(PipeError::IccMute)))
-                        } else {
-                            self.handle_xfer(command).await
+                        match self.reject_if_card_inactive() {
+                            Some(rejection) => Ok(rejection),
+                            None => self.handle_xfer(command).await,
                         }
                     }
                     // Handled above, before the abort-pending check.
@@ -1142,7 +1162,9 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     }
                     Command::Secure(command) => {
                         trace!("CCID: Secure command received, data: {=[u8]:x}", command.data());
-                        Ok(self.handle_secure(command))
+                        Ok(self
+                            .reject_if_card_inactive()
+                            .unwrap_or_else(|| self.handle_secure(command)))
                     }
                     Command::Mechanical(_mechanical) => {
                         trace!("CCID: Mechanical command received, data: {=[u8]:x}", _mechanical);
@@ -1354,6 +1376,17 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
 
     /// Handles PC_to_RDR_Secure. Only PIN verification is supported: the request is passed to the
     /// application, which supplies the PIN, and its response is returned like an XfrBlock's.
+    /// Rejects a command that needs the card (XfrBlock, Secure) while the card is inactive, i.e. powered off by the
+    /// host or reset by the application: the host must power it on again first, so commands cannot reach the
+    /// application across a card session boundary.
+    fn reject_if_card_inactive(&self) -> Option<ResponseType> {
+        if self.slot_status == 0x00 {
+            return None;
+        }
+        warn!("CCID: Card command while the card is inactive, rejecting");
+        Some(ResponseType::Internal(self.failed_data_block(PipeError::IccMute)))
+    }
+
     fn handle_secure(&mut self, command: Secure) -> ResponseType {
         if !self.pin_verify_supported {
             trace!("CCID: Secure command received but PIN verification is not advertised, rejecting");
