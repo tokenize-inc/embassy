@@ -498,6 +498,31 @@ pub struct CcidReaderWriter<'d, D: Driver<'d>, const READ_N: usize, const WRITE_
     // dropped when it arrives, and new XfrBlocks are rejected as busy until then, so it can't be
     // mistaken for the response to a later command.
     discard_app_response: bool,
+    // A message rejected after its header was parsed, whose remaining packets are being dropped
+    // before the rejection is sent.
+    discarding: Option<DiscardedMessage>,
+}
+
+/// A message rejected after its header was parsed. The rest of its transfer is read and dropped
+/// before the rejection is sent, so its payload isn't parsed as new commands.
+#[derive(Copy, Clone, Debug)]
+struct DiscardedMessage {
+    message_type: u8,
+    slot: u8,
+    seq: u8,
+    // Bytes of the message, per its dwLength, not yet received.
+    remaining: usize,
+}
+
+/// The RDR_to_PC_* message type that answers a PC_to_RDR_* command (CCID 1.1 section 6.2).
+fn response_message_type(command: u8) -> u8 {
+    match command {
+        0x62 | 0x69 | 0x6F => 0x80, // IccPowerOn, Secure, XfrBlock: RDR_to_PC_DataBlock
+        0x61 | 0x6C | 0x6D => 0x82, // SetParameters, GetParameters, ResetParameters: RDR_to_PC_Parameters
+        0x6B => 0x83,               // Escape: RDR_to_PC_Escape
+        0x73 => 0x84,               // SetDataRateAndClockFrequency: RDR_to_PC_DataRateAndClockFrequency
+        _ => 0x81,                  // RDR_to_PC_SlotStatus
+    }
 }
 
 fn build<'d, D: Driver<'d>>(
@@ -607,6 +632,7 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
             abort_signal,
             pin_verify_supported,
             discard_app_response: false,
+            discarding: None,
             ccid_to_app,
             protocol_data: ProtocolData::default(),
         }
@@ -862,6 +888,10 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         // (which itself may have command chaining on a higher level, e.g.
         // when certificates are transmitted, because PIV somehow uses short APDUs
         // only (can we fix this), so 255B is the maximum)
+        if let Some(discard) = self.discarding.take() {
+            return Ok(self.drain_rejected(discard, packet.len()));
+        }
+
         if !self.receiving_long {
             if packet.len() < CCID_HEADER_LEN {
                 error!("CCID: unexpected short packet");
@@ -883,8 +913,14 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     message_len,
                     self.ext_packet.capacity()
                 );
+                let discard = DiscardedMessage {
+                    message_type: packet[0],
+                    slot: packet[5],
+                    seq: packet[6],
+                    remaining: message_len,
+                };
                 self.reset_state();
-                return Ok(ResponseType::None);
+                return Ok(self.drain_rejected(discard, packet.len()));
             }
             if packet.len() < message_len {
                 self.receiving_long = true;
@@ -906,8 +942,16 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
                     self.ext_packet.capacity(),
                     self.ext_packet.len() + packet.len(),
                 );
+                // The host sent more than the header declared, so the declared message is already
+                // complete; answer it now. The failed extend left the header in place.
+                let discard = DiscardedMessage {
+                    message_type: self.ext_packet[0],
+                    slot: self.ext_packet[5],
+                    seq: self.ext_packet[6],
+                    remaining: 0,
+                };
                 self.reset_state();
-                return Ok(ResponseType::None);
+                return Ok(self.drain_rejected(discard, packet.len()));
             }
             self.in_chain += 1;
             if packet.len() > self.long_packet_missing {
@@ -1152,6 +1196,40 @@ impl<'d, D: Driver<'d>, const READ_N: usize, const WRITE_N: usize> CcidReaderWri
         self.pending_seq = None;
         self.bulk_abort = None;
         self.control_abort = None;
+        self.discarding = None;
+    }
+
+    /// Drops one packet of a rejected message's transfer. Once the transfer has ended, answers
+    /// the message with BadLength.
+    ///
+    /// The transfer ends when the bytes its dwLength declared have arrived, or on a short packet,
+    /// which ends a USB transfer whatever the header claimed (so a bogus dwLength can't make us
+    /// discard forever). The reply waits until then: a host that writes the whole command before
+    /// reading the response would otherwise block on its write while we block on ours.
+    fn drain_rejected(&mut self, mut discard: DiscardedMessage, packet_len: usize) -> ResponseType {
+        discard.remaining = discard.remaining.saturating_sub(packet_len);
+        if discard.remaining != 0 && packet_len >= self.bulk_out.max_packet_size() {
+            self.discarding = Some(discard);
+            return ResponseType::None;
+        }
+        trace!("CCID: Rejecting seq {} with BadLength", discard.seq);
+        ResponseType::Internal(self.failed_response(
+            discard.message_type,
+            discard.slot,
+            discard.seq,
+            PipeError::BadLength,
+        ))
+    }
+
+    /// Builds a failed response, of the message type that answers `command`.
+    fn failed_response(&self, command: u8, slot: u8, seq: u8, error: PipeError) -> ExtPacket {
+        let mut packet = ExtPacket::zeroed_until(CCID_HEADER_LEN);
+        packet[0] = response_message_type(command);
+        packet[5] = slot;
+        packet[6] = seq;
+        packet[7] = CCID_CMD_FAIL | self.slot_status;
+        packet[8] = error as u8;
+        packet
     }
 
     // Completes an ABORT. Only call this once matching ABORT requests have arrived on both the
@@ -1640,6 +1718,11 @@ impl<'d, D: Driver<'d>> CcidBulkIn<'d, D> {
 }
 
 impl<'d, D: Driver<'d>> CcidBulkOut<'d, D> {
+    /// The endpoint's max packet size. A shorter packet ends a transfer.
+    fn max_packet_size(&self) -> usize {
+        usize::from(self.ep_out.info().max_packet_size)
+    }
+
     /// Waits for the interrupt out endpoint to be enabled.
     pub async fn ready(&mut self) {
         self.ep_out.wait_enabled().await;
@@ -1652,7 +1735,7 @@ impl<'d, D: Driver<'d>> CcidBulkOut<'d, D> {
     /// future cancel-safe: dropping it never loses data already taken from the endpoint.
     /// Zero-length packets are skipped. `buf` must hold at least one max-size packet.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
-        let max_packet_size = usize::from(self.ep_out.info().max_packet_size);
+        let max_packet_size = self.max_packet_size();
         assert!(buf.len() >= max_packet_size);
 
         loop {
