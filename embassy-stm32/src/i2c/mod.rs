@@ -85,7 +85,7 @@ impl Config {
         #[cfg(gpio_v2)]
         return AfType::output_pull(
             OutputType::OpenDrain,
-            Speed::Medium,
+            Speed::VeryHigh,
             match self.scl_pullup {
                 true => Pull::Up,
                 false => Pull::None,
@@ -99,7 +99,7 @@ impl Config {
         #[cfg(gpio_v2)]
         return AfType::output_pull(
             OutputType::OpenDrain,
-            Speed::Medium,
+            Speed::VeryHigh,
             match self.sda_pullup {
                 true => Pull::Up,
                 false => Pull::None,
