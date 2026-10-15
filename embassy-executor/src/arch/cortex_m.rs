@@ -100,10 +100,31 @@ mod thread {
         pub fn run(&'static mut self, init: impl FnOnce(Spawner)) -> ! {
             init(self.inner.spawner());
 
+            let raw_dwt_ctr = 0xE0001000 as *mut u32;
+            let raw_dwt_cyccnt = 0xE0001004 as *mut u32;
+            let raw_dwt_sleepcnt = 0xE0001010 as *mut u32;
+
+            let dwt_ctrl = unsafe { raw_dwt_ctr.as_mut().unwrap() };
+            let dwt_cyccnt = unsafe { raw_dwt_cyccnt.as_mut().unwrap() };
+            let dwt_sleepcnt = unsafe { raw_dwt_sleepcnt.as_mut().unwrap() };
+
+            let mut t: u32;
+            let mut l: u32 = 0;
+            let mut _working_time: u32 = 0;
+            let mut _sleeping_time: u32 = 0;
+
+            // Enable the cycle counter
+            *dwt_ctrl = *dwt_ctrl & (1 << 0);
+            // Enable the sleep counter
             loop {
                 unsafe {
                     self.inner.poll();
+
+                    _working_time += *dwt_cyccnt - l;
+                    t = *dwt_cyccnt;
                     asm!("wfe");
+                    _sleeping_time = *dwt_cyccnt - t;
+                    l = *dwt_cyccnt;
                 };
             }
         }
